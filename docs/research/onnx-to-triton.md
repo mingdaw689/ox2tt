@@ -1,16 +1,17 @@
 # ONNX → Triton IR 转换：一手资料调研与工程建议
 
-- 日期：2026-11-09
-- 范围：ONNX 模型到 Triton IR（TTIR）的转换器架构选型
-- 方法：优先阅读本机源码（`/root/triton`、`/root/onnx-mlir`、`/root/triton-shared`、`/root/triton-linalg`、`/root/FlagTree`、`/root/PaddleTritonOps`、`/root/nkct`、`/root/llvm-project`），再核对官方文档与规范，并检索社区项目。另做了若干最小实测（见 §1.2 与附录 A）。
+- 日期：2026-11-12（初版 2026-11-09；本次增补 `/root/ninetoothed` 与 `/root/InfiniOps` 调研）
+- 范围：ONNX 模型到 Triton IR（TTIR）的转换器架构选型，以及与 Triton 相邻的 DSL / 算子库生态
+- 方法：优先阅读本机源码（`/root/triton`、`/root/onnx-mlir`、`/root/triton-shared`、`/root/triton-linalg`、`/root/FlagTree`、`/root/PaddleTritonOps`、`/root/nkct`、`/root/llvm-project`、`/root/ninetoothed`、`/root/InfiniOps`），再核对官方文档与规范，并检索社区项目。另做了若干最小实测（见 §1.2 与附录 A）。star/PyPI 元数据于 2026-11-12 读取 GitHub REST API 与 PyPI JSON API。
 - 说明：本报告不引用任何既有内部 PoC 或其产物；所有结论仅基于本机一手源码、官方规范与本报告的独立实测。
 - 证据标记：
   - **【源码】** 本机源码可直接确认，给出 `路径:行号`
   - **【文档】** 官方文档/规范确认，给出 URL
   - **【实测】** 本报告在 2026-11-09 实际运行验证
-  - **【检索】** 基于 2026-11-09 的网络检索，可能遗漏
+  - **【检索】** 基于 2026-11-09 初版与 2026-11-12 增补的网络检索，可能遗漏
   - **【推断】** 基于以上事实的工程判断，不是事实陈述
 - 版本说明：本报告的 Triton 源码行号以 `/root/triton`（**3.6.0**）为准；本机实际安装的是 **3.8.0**。两者符号名与管线结构基本一致，但行号会偏移（例如 `add_stages` 在 3.8.0 中位于 `backends/nvidia/compiler.py:598`，在 3.6.0 中位于 `third_party/nvidia/backend/compiler.py:556`）。引用时请以符号名为主、行号为辅。
+- 增补版本：NineToothed 本地为 **0.26.0**（PyPI 同版本发布于 2026-06-30，本地 HEAD `4295e9c` 领先该 tag 36 个提交）；InfiniOps 本地为 **0.1.0**（无 release tag，HEAD `8b63a0f` 日期 2026-11-11）。
 
 ---
 
@@ -33,6 +34,7 @@
   - [3.1 本地仓库逐个定位](#31-本地仓库逐个定位)
   - [3.2 社区项目现状](#32-社区项目现状)
   - [3.3 盘点结论](#33-盘点结论)
+  - [3.4 NineToothed 与 InfiniOps 深入调研](#34-ninetoothed-与-infiniops-深入调研)
 - [4. 可行架构方案对比](#4-可行架构方案对比)
   - [4.1 方案 A：基于 MLIR 的 ONNX → TTIR](#41-方案-a基于-mlir-的-onnx--ttir)
   - [4.2 方案 B：生成 Triton Python DSL，再编译得到 TTIR](#42-方案-b生成-triton-python-dsl再编译得到-ttir)
@@ -55,7 +57,9 @@
 3. **但 TTIR 不是稳定 ABI**：Triton 官方文档没有给出 TTIR 的版本化/兼容性承诺，`tt` dialect 的 op 集合直接由 `TritonOps.td` 定义并随版本变化；`triton.compile` 甚至不在公开 Python API 文档的索引里。因此 TTIR 适合做“绑定 Triton 版本的编译产物契约”，不适合做“跨版本稳定的公共接口”。【源码】【文档】【推断】
 4. **ONNX 侧没有现成的 ONNX → Triton 路径**：onnx-mlir 的 `ONNXToLinalg` 目前只支持 2D×2D MatMul 和受限的 4D Conv；其主力路径是 ONNX → Krnl → affine/LLVM（CPU 导向）。【源码】`/root/onnx-mlir/src/Conversion/ONNXToLinalg/Math/MatMul.cpp:7-14`、`NN/Conv.cpp:9-16`
 5. **社区没有成熟的 ONNX → Triton IR 开源项目**：`triton-shared` 与 `triton-linalg` 都是反方向（Triton → Linalg）；`NKCT/CKTI` 是 CUDA → Triton IR；`PaddleTritonOps` 是 Triton 算子库；FlagTree 是多后端 Triton 分支；ONNX Runtime 只是把预编译的 Triton kernel 嵌进 EP，并不做图级转换。最接近的工业级先例是 XLA:GPU 的 Triton fusion emitter（HLO → TTIR）。【检索】【源码】
+   - **2026-11-12 增补**：新调研的 NineToothed 是“Triton 之上的张量元编程 DSL / 多后端 kernel 生成器”，InfiniOps 是“跨平台 C++ 算子库”。两者分别处在 kernel 生成层和算子执行层，都没有 ONNX 图前端，也不直接产出 TTIR，因此不改变上述结论（详见 §3.4）。【源码】【检索】
 6. **推荐路线：B-first, A-ready**。先用“Python 图 IR + 生成 Triton DSL + 调 Triton 前端产出 TTIR”的方案拿到正确、可验证的 TTIR，再保留把 codegen 后端替换为 MLIR pass（方案 A）的接口。输出契约建议为“**每个 kernel 一个 `.ttir` 文件 + 一份 manifest.json**”，而不是一个巨大的单文件 TTIR。
+   - **2026-11-12 增补**：NineToothed 不构成独立方案，只构成 B 的可选前端变体 B′（§4.2.1）。v0 仍直接生成 Triton Python；把 `KernelPlan → 源码` 做成可替换接口，以便未来插入 B′。InfiniOps 不进入 v0 依赖，只在“多硬件执行 ONNX 图”成为产品目标时评估（§7.1）。
 
 ---
 
@@ -446,6 +450,8 @@ ONNX 的 `ValueInfoProto` 里，shape 可以是：
 | `/root/PaddleTritonOps` | Triton 算子库 | 用 Triton 实现 Paddle 算子（softmax、matmul、conv2d、flash attention 等），统一 runtime/backend 包装 | 内部仓库，活跃 | **方案 C 的现成素材**；不是 IR 转换器 |
 | `/root/nkct` | CUDA → Triton IR | Clang 解析 CUDA → `nk` dialect → `tt`/TTGIR；`AffineToTriton` 用 MLIR `DialectConversion` 构造 `tt.load/store/reduce` | 内部仓库；对应论文 CKTI | **方案 A 的可行性证据**；输入不是 ONNX |
 | `/root/llvm-project` | MLIR 基础设施 | `ConversionTarget`、`TypeConverter`、`RewritePattern`、`applyPartialConversion` | 活跃 | 方案 A 的基础设施 |
+| `/root/ninetoothed` | Triton 之上的张量元编程 DSL / 多后端 kernel 生成器 | TOM + arrange-and-apply；`ninetoothed.make` 先冻结为 `ssa.Program`，再由后端 emitter 生成 Triton/CUDA/TileLang/AscendC/BangC 源码；Triton 后端输出 `@triton.jit` Python 文件，**不是 TTIR**。无 ONNX 前端 | 活跃（471 stars；v0.26.0；HEAD 2026-11-02；PyPI 0.26.0 落后 HEAD 36 个提交） | **可选 codegen 前端（方案 B′）**；不解决 ONNX 语义 lowering；详见 §3.4.1 |
+| `/root/InfiniOps` | 跨平台 C++ 算子库 + 算子级调度 + Python 绑定 | 573 个 `src/base/*.h` 算子基类；CPU/NVIDIA/Iluvatar/Hygon/T-Head/MetaX/Mars/Moore/Cambricon/Ascend 后端；可选 ATen、Triton JIT（仅 `add`）、NineToothed AOT（4 个 norm 算子）；依赖 InfiniRT；**无图/ONNX 前端** | 活跃但年轻（6 stars；2026-02 起 322 个提交；无 release tag） | 仅可作为 host 侧 fallback 算子库/执行层候选；不能作为 TTIR 后端；详见 §3.4.2 |
 
 补充事实：
 
@@ -454,10 +460,12 @@ ONNX 的 `ValueInfoProto` 里，shape 可以是：
 - `FlagTree` 是 Triton 的多后端 fork，不包含 ONNX 前端。【源码】`/root/FlagTree/README.md`（多后端表）
 - `PaddleTritonOps` 的 `OperatorList.md` 列出了 150+ 个条目（含不同版本/变体），是“逐算子 kernel 库”的典型形态。【源码】`/root/PaddleTritonOps/OperatorList.md`
 - `nkct` 的 `AffineToTriton.cpp` 用 `rewriter.create<triton::LoadOp/StoreOp/ReduceOp/GetProgramIdOp>` 构造 TTIR，并用 `ConversionTarget` 把 `func/memref` 标为 illegal。【源码】`/root/nkct/src/AffineToTriton.cpp:711,795-837,1100-1140`
+- `ninetoothed` 的 Python 源码共 94 个文件、约 3.8 万行，67 个 `test_*.py`（`tests/` 下共 71 个文件）；`pyproject.toml` 的硬依赖只有 `triton>=3.0.0`、`sympy`、`numpy`，torch 只出现在 `debugging`/`visualization` extra 中。代码里没有任何 `onnx` 或 `ttir` 引用。【源码】`/root/ninetoothed/pyproject.toml:7,11,23-25`
+- `InfiniOps` 的 `src/base/` 有 573 个算子基类头文件，但各后端覆盖不均（NVIDIA 76 个、Iluvatar 43 个、Moore 43 个、MetaX 41 个、Ascend 27 个、CPU 21 个、Cambricon 20 个、T-Head/Hygon 各 18 个）；仓库内没有 `onnx`/`ttir`/`mlir` 转换代码，`onnx` 只出现在算子命名与语义对齐文档中。整体是 C++17 + CMake 的算子库，不是图编译器。【源码】`/root/InfiniOps/README.md:3,5-11`、`/root/InfiniOps/docs/api/operators.md:33-45`
 
 ### 3.2 社区项目现状
 
-检索结论（截至 2026-11-09）：**没有找到成熟的、公开的 “ONNX → Triton IR” 转换器**。【检索】
+检索结论（截至 2026-11-12）：**没有找到成熟的、公开的 “ONNX → Triton IR” 转换器**。【检索】
 
 最接近的项目都不是这个方向：
 
@@ -470,17 +478,150 @@ ONNX 的 `ValueInfoProto` 里，shape 可以是：
 | [ONNX Runtime Triton kernel](https://github.com/microsoft/onnxruntime/blob/main/docs/ORT_Use_Triton_Kernel.md) | 预编译 Triton kernel 嵌入 ORT EP | 仅 softmax，主要 ROCm 路径 | 不做图级转换 |
 | [IBM/onnxmlir-triton-backend](https://github.com/IBM/onnxmlir-triton-backend) | 把 onnx-mlir 编译出的 `.so` 部署到 Triton Inference Server | 5 stars，2024 后不活跃 | 是 serving 后端，不是 IR 转换 |
 | [KernelLens](https://zenodo.org/records/23194523) | Triton kernel → ONNX/TensorRT 插件 | 新项目 | 反方向 |
+| [InfiniTensor/ninetoothed](https://github.com/InfiniTensor/ninetoothed) | Triton 之上的张量元编程 DSL / 多后端 kernel 生成器 | 471 stars，活跃，Apache-2.0，PyPI 0.26.0 | 不是 ONNX 前端，也不直接产出 TTIR；可作为方案 B′ 的 codegen 前端 |
+| [InfiniTensor/InfiniOps](https://github.com/InfiniTensor/InfiniOps) | 跨平台 C++ 算子库（算子级调度） | 6 stars，2026-02 创建，活跃但年轻，Apache-2.0 | 不是图编译器/ONNX 前端；只能在 host 侧作为 fallback 算子库 |
 | 中国专利 CN119336336B | ONNX → MLIR/Triton codegen | 专利，无开源实现 | 不可直接用 |
 
 另外，`Avi197/pytorch-to-onnx-to-triton` 之类的仓库名字容易误导，实际是 Triton Inference Server 的部署示例，不是编译器。【检索】
 
 ### 3.3 盘点结论
 
-1. **“ONNX → Triton IR” 是一个真实存在的空白**。现有工作要么是 Triton → Linalg（供 CPU/其他后端），要么是 CUDA → Triton（NKCT/CKTI），要么是 HLO → TTIR（XLA），要么是把 Triton kernel 塞进 ONNX Runtime。
+1. **“ONNX → Triton IR” 是一个真实存在的空白**。现有工作要么是 Triton → Linalg（供 CPU/其他后端），要么是 CUDA → Triton（NKCT/CKTI），要么是 HLO → TTIR（XLA），要么是把 Triton kernel 塞进 ONNX Runtime；新调研的 NineToothed 与 InfiniOps 则分别处在“Triton 之上的 kernel DSL”和“跨平台算子库”两层。
 2. **onnx-mlir 不能直接复用为 Triton 前端**：它的 ONNXToLinalg 只有两个 pattern（MatMul 2D、Conv 4D 且限制很多），主力是 ONNXToKrnl（CPU 导向）。【源码】`MatMul.cpp:7-14`、`Conv.cpp:9-16`、`ConvertONNXToLinalg.cpp:54-57`
 3. **最接近的工业先例是 XLA:GPU**：它证明了“在 MLIR 里程序化构造 TTIR 并交给 Triton 后端”在产品中可行。NKCT/CKTI 则证明了用 MLIR `DialectConversion` 构造 `tt` op 的可行性，但输入是 CUDA 而非 ONNX。
 4. **TTIR 作为编译输入是可验证的**：本报告独立实测了 `.ttir → TTGIR → LLIR → PTX → cubin`（见附录 A），因此“转换器输出 TTIR”在技术上成立；但 TTIR 的版本稳定性风险仍需单独管理。
 5. **PaddleTritonOps 证明了方案 C 的可行性**，但它不是转换器；它更适合作为“某些难算子的手写 kernel 后备库”。
+6. **2026-11-12 增补：出现了“Triton 之上的 DSL”与“跨平台算子库”两类相邻工作，但没有改变空白本身**。NineToothed 把 kernel 编写抽象为 arrange-and-apply，并在自己的 SSA IR 上支持多后端；InfiniOps 把多厂商算子实现收敛到统一 C++ 调度。两者都不解析 ONNX 图、不做图级融合、不产出 TTIR，因此“没有成熟的 ONNX → Triton IR 开源实现”仍然成立；它们分别对应“kernel 生成层”和“算子执行层”，而不是“图转换层”。【源码】【检索】
+
+### 3.4 NineToothed 与 InfiniOps 深入调研
+
+本节回答两个问题：这两个项目到底是什么；它们能否被本项目的 ONNX → TTIR 管线复用。先给结论：**两者都不是 ONNX 前端，也都不能直接产出 TTIR；NineToothed 是“Triton 之上的 kernel DSL/多后端生成器”，InfiniOps 是“多厂商算子库/执行层”**。它们对项目有价值的部分分别在“codegen 抽象”和“host 侧 fallback”，而不是“图转换”。
+
+#### 3.4.1 NineToothed：Triton 之上的张量元编程 DSL
+
+**身份与基本事实**
+
+- 仓库：`git@github.com:InfiniTensor/ninetoothed.git`，Apache-2.0；PyPI 包名 `ninetoothed`，本地版本 `0.26.0`。【源码】`/root/ninetoothed/LICENSE:1`、`/root/ninetoothed/pyproject.toml:6-12`
+- 公开活跃度：471 stars、56 forks、60 open issues；GitHub `pushed_at` 为 2026-11-09；本地 HEAD 是 2026-11-02 的 “Add AscendC baseline support (#265)”。【检索】[GitHub 仓库](https://github.com/InfiniTensor/ninetoothed)
+- 发布节奏：PyPI 上最新版 `0.26.0` 的上传时间是 2026-06-30，对应 tag `v0.26.0`；本地 HEAD 比该 tag 多 36 个提交，包含 AscendC/BangC baseline、frontend 解耦等。**“pip 装到的版本”和“仓库 HEAD”不是一回事**，这是引入依赖时必须注意的版本风险。【检索】【源码】`git log v0.26.0..HEAD`
+
+**它到底是什么**
+
+NineToothed 的核心不是“写 Triton 的语法糖”，而是三层东西：
+
+1. **符号张量（symbolic tensor）**：`Tensor(2)` 不持有数据，`shape`/`strides` 是符号表达式（用 SymPy 风格表达）；因此可以在编译期对张量做代数运算。【文档】[The Basics](https://ninetoothed.org/basics.html)、`/root/ninetoothed/docs/source/basics.rst:23-35`
+2. **TOM（Tensor-Oriented Metaprogramming）**：在符号张量上做 `tile`、`expand`、`squeeze`、`permute` 等“元操作”，把逻辑张量排布成多层嵌套张量：外层决定 program 网格，内层是每个 program 处理的 tile。文档明确说这是“编译期的元编程”，不是运行时张量运算。【文档】`/root/ninetoothed/docs/source/basics.rst:37-67`
+3. **arrange-and-apply 范式**：用户分别写 `arrangement`（如何切 tile/广播/对齐）与 `application`（每个 tile 上做什么计算），再连同 `tensors` 一起交给 `ninetoothed.make` 生成 kernel。README 与文档都把这三件套作为主入口。【文档】`/root/ninetoothed/README.md:22-24`、`/root/ninetoothed/docs/source/basics.rst:71-112`
+
+一个最小的矩阵乘例子如下（来自 README）：`arrangement` 把 `input/other/output` tile 成块并对 `input` 做行扩展、对 `other` 做列扩展；`application` 对每个输出块累加 `ntl.dot`；`ninetoothed.make(arrangement, application, tensors)` 返回可调用 kernel。【源码】`/root/ninetoothed/README.md:30-70`
+
+**真实编译管线（这是与“直接写 Triton”最关键的区别）**
+
+`ninetoothed.make` 只是历史兼容入口（`src/ninetoothed/make.py:6-41`），实际调用链是 `compiler/driver.py`：
+
+1. `make(arrangement, application, tensors, backend=...)` 构造 `CompileRequest`，交给 `DEFAULT_COMPILER.materialize(...)`。【源码】`/root/ninetoothed/src/ninetoothed/compiler/driver.py:193-220`
+2. `Compiler.frontend()` 把 Python 语义“冻结”成与后端无关的 IR：
+   - 若给了 `arrangement`，就在编译期执行 `request.arrangement(*tensors)`，得到嵌套符号张量；
+   - `application` 通过 `inspect.getsource` 取源码，再用 `ast.parse` 解析成 `ssa.Program`；
+   - 产物是 `FrontendModule`（tensors、program、symbols、symbol_roles、meta_domains 等），之后不再重新进入 Python 前端。【源码】`/root/ninetoothed/src/ninetoothed/frontend/module.py:16-33,73-83`、`/root/ninetoothed/src/ninetoothed/frontend/python.py:70,96`
+3. SSA IR 是单 entry block 的 `ssa.Program`，每条 `Operation` 有 `opcode`、`operands`、`results`、`attrs`、`regions`；类型是 `ssa.Type(kind, shape, dtype, attrs)`。它已经是一个结构化、可验证的 kernel IR，不再是 Python 语法树。【源码】`/root/ninetoothed/src/ninetoothed/ir/ssa.py:16-87`、`/root/ninetoothed/src/ninetoothed/ir/module.py:15-30`
+4. 后端 emitter 按 `Target` 分发。`Target` 枚举有 5 个值：`triton`、`tilelang`、`cuda`、`ascendc`、`bangc`；默认 registry 把 5 个后端都注册进去，默认是 `triton`。【源码】`/root/ninetoothed/src/ninetoothed/backends/core.py:11-26`、`/root/ninetoothed/src/ninetoothed/backends/__init__.py:22-34`
+5. Triton 后端 `emits_source=True`，生成的是 **Triton Python 源码**：文件头 `import triton` / `import triton.language as tl`，主体是 `@triton.jit def <name>_kernel(...)`，再加一个 `launch_<name>()` 包装；suffix 是 `triton.py`。【源码】`/root/ninetoothed/src/ninetoothed/backends/triton.py:29-40`、`/root/ninetoothed/src/ninetoothed/backends/emitters/triton.py:58-62,712-744`
+6. 物化阶段：JIT 把源码写到缓存目录、`import` 进来、包装 launch 并做 autotune；AOT 则编译成 `.so`，Triton 构建还可以导出 C++ 源码和公共头文件。【源码】`/root/ninetoothed/src/ninetoothed/backends/materializers/triton.py:52-58,133-152`、`/root/ninetoothed/docs/source/build.rst:11`
+7. 另有 compile-only 入口 `ninetoothed.compiler.lower()`：只做前端冻结 + SSA + backend emit，返回 `Artifact`，不初始化后端 runtime；`write=True` 时把源码写到 `output_dir`。这条路径最适合“只要源码、不要执行”的场景。【源码】`/root/ninetoothed/src/ninetoothed/compiler/driver.py:236-281`
+
+**它输出什么、依赖什么**
+
+- **不输出 TTIR**。整个 `src/` 没有 `ttir` 字样；它输出的是 Triton Python 源码（不是 Triton AST，也不是 TTIR）。只有把这份源码再交给 Triton 前端（`ASTSource.make_ir` + `make_ttir`）才会得到 TTIR。因此它比方案 B 多一层，而不是替代 Triton。【源码】（`rg -ni ttir src/ninetoothed` 无结果）
+- **强依赖 Triton**：`pyproject.toml` 的硬依赖是 `triton>=3.0.0`、`sympy>=1.13.0`、`numpy>=1.26.4`；`language.py` 在 import 时直接 `from triton.language.extra import libdevice`。没有 Triton 就无法工作。【源码】`/root/ninetoothed/pyproject.toml:11`、`/root/ninetoothed/src/ninetoothed/language.py:3`
+- **不强依赖 torch**：核心依赖里没有 torch，torch 只出现在 `debugging`/`visualization` extra；源码里的 torch import 都是延迟导入（autotuner、benchmark、debugging、runtime 的 torch caller）。但它的默认调用方是 `caller="torch"`，示例和测试大量使用 torch，生态是 torch 中心的。【源码】`/root/ninetoothed/pyproject.toml:23-25`、`/root/ninetoothed/src/ninetoothed/compiler/driver.py:44,201-212`
+- **没有 ONNX 前端**。`rg -ni onnx src tests examples docs` 无结果；它不理解 `ModelProto`、`NodeProto`、opset，也不做 shape inference。
+
+**多后端与 AscendC 的含义**
+
+- 5 个后端共享同一套 SSA lowering，后端只负责“目标语言怎么拼”：CUDA 生成 CUDA C，TileLang 生成 TileLang，AscendC 生成 AscendC C++，BangC 生成 BANG C。这是“同一 kernel IR 多目标”，不是“Triton 翻译成别的语言”。【源码】`/root/ninetoothed/src/ninetoothed/backends/cuda.py:1-5,32-51`、`/root/ninetoothed/src/ninetoothed/backends/tilelang.py:1-5,30-42`
+- **AscendC 后端是 baseline，不是性能路径**：它用本地 CANN 的 CCEC 编译，在当前 `torch_npu` stream 上启动；文档明确说“single scalar executor”、没有 vector instruction selection、没有 Cube 矩阵原语、没有 autotuning、拒绝 atomic，fp64/fp8 不支持，大融合 kernel 可能很慢。它证明的是“NineToothed 的 SSA 能落到昇腾”，不是“能生成高性能 Ascend kernel”。【文档】`/root/ninetoothed/docs/source/ascendc.rst:4-8,18-43`、【源码】`/root/ninetoothed/src/ninetoothed/backends/ascendc.py:9-20`
+- **BangC 后端同样是 scalar baseline**：文档说没有 vectorized NRAM dataflow、DMA schedule、batched row execution 或 native matrix primitives。【文档】`/root/ninetoothed/docs/source/bangc.rst:4-7,38-40`
+
+**SSA 的算子词汇表（决定它能表达什么）**
+
+从 `ir/operations.py` 与前端注册看，SSA 的 op 主要是 tile 级通用操作：
+
+- 内存：`mem.load`、`mem.store`、`mem.atomic_add`、`mem.data_ptr`
+- 算术/比较/选择：`arith.*`、`cmp.*`、`select.where`、`math.*`（`exp`、`log`、`sqrt`、`erf` 等）
+- 形状/视图：`tensor.view`、`tensor.extract`、`tensor.stride`、`tensor.zeros`、`tensor.full`、`shape.dim`
+- 线性代数：`linalg.matmul`、`linalg.dot`、`linalg.transpose`
+- 规约：`reduce.min`、`reduce.max`、`reduce.sum`
+- 控制流：`scf.for`、`scf.if`、`scf.yield`
+
+【源码】`/root/ninetoothed/src/ninetoothed/ir/operations.py:444-468`、`/root/ninetoothed/src/ninetoothed/frontend/python.py:992,1604`
+
+**没有** `conv`、`pool`、`softmax`、`layer_norm` 这类高层 op；这些仍然要由上层展开成 `mem.load` + `linalg.matmul` + `reduce.*` + `scf.*` 的组合。也就是说，NineToothed 提供的是“更好的 kernel 写法”，不是“ONNX 算子语义库”。（`ntops` 是另一个仓库，提供 LLM 常用算子，不在本仓库内。）【源码】【检索】[InfiniTensor/ntops](https://github.com/InfiniTensor/ntops)
+
+**成熟度与风险**
+
+- 代码规模：94 个 Python 文件、约 3.8 万行；67 个 `test_*.py`，覆盖 add/matmul/conv2d/max_pool2d/softmax/attention/reduction/各后端/AOT 等。测试面不窄，但版本仍是 0.x。【源码】（`find src -name '*.py'`、`ls tests/test_*.py`）
+- API 仍在演进：本地提交里有 “Decouple frontend (#259)”、“Unify native runtime binding (#263)”、“Add AscendC baseline (#265)” 等结构性改动；`make`/`aot`/`build` 之上又加了一层 `Compiler`/`CompileRequest`/`FrontendModule`。把它作为依赖意味着要跟它的 SSA/前端契约走。【源码】`git log --oneline -15`
+- 许可证 Apache-2.0，与项目兼容。【源码】`/root/ninetoothed/LICENSE:1`
+- 文档完整度中上：有 https://ninetoothed.org/ 与 `docs/source/`（basics/build/ascendc/bangc/named_layout/python_api），覆盖主要用法；但 0.x 阶段部分契约（`FrontendModule`/SSA）主要靠源码说明，文档只承诺“未来的 frontend 必须产出同样的 module 契约”。【文档】`/root/ninetoothed/docs/source/index.rst:10-18`、`/root/ninetoothed/docs/source/python_api/code_generation.rst:44-48,75-78`
+- 依赖负担中等：`triton` + `sympy` + `numpy`；如果只用“编译出源码”的路径，理论上可以不装 torch（源码中的 torch import 都是延迟导入），但执行/autotune 仍以 torch 为主。【推断】
+
+#### 3.4.2 InfiniOps：跨平台算子库，不是图编译器
+
+**身份与基本事实**
+
+- 仓库：`git@github.com:InfiniTensor/InfiniOps.git`，Apache-2.0；C++17 + CMake 3.18+，Python 3.10+；版本 `0.1.0`，没有 release tag。【源码】`/root/InfiniOps/README.md:1-11`、`/root/InfiniOps/pyproject.toml`
+- 公开活跃度：6 stars、19 forks、83 open issues；2026-02-04 创建，322 个提交，HEAD 2026-11-11。活跃，但外部采用度很低。【检索】[GitHub 仓库](https://github.com/InfiniTensor/InfiniOps)
+- 硬依赖 **InfiniRT**：README 要求先安装 InfiniRT，并传入 `INFINI_RT_ROOT`；`src/runtime.h` 直接 `#include <infini/rt.h>`，并把 `infini::rt::runtime::Runtime<device_type>` 作为运行时抽象。【源码】`/root/InfiniOps/README.md:5-11,15-20`、`/root/InfiniOps/src/runtime.h:4,8-9`、`/root/InfiniOps/docs/compatibility.md:31-36`
+
+**它到底是什么**
+
+InfiniOps 是“算子库 + 算子级调度 + 多后端实现”，不是图编译器、不是推理框架：
+
+- 每个算子有一个 base class（`src/base/<op>.h`），每个设备有零个或多个实现（`src/native/.../ops/<op>/`）；`Operator<Key, Device, Index>` 用设备类型和实现槽位做特化，`DispatchFunc` 把运行时 device/dtype 映射到编译期 functor。【源码】`/root/InfiniOps/src/operator.h:347,383`、`/root/InfiniOps/src/dispatcher.h:109-121`、`/root/InfiniOps/docs/api/operators.md:33-45`
+- 调用形态是“显式算子调用 + 预分配输出”：Python 侧 `infini.ops.gemm(a, b, out)`，C++ 侧 `infini::ops::Gemm::Call(a, b, out)`；需要 stream/workspace/实现选择时显式传 `Handle` 和 `Config`。【文档】`/root/InfiniOps/docs/api/operators.md:6-31`、`/root/InfiniOps/docs/compatibility.md:8-19`
+- 规模：`src/base/` 有 573 个算子基类头文件；后端实现目录数量为 NVIDIA 76、Iluvatar 43、Moore 43、MetaX 41、Mars 41、Ascend 27、CPU 21、Cambricon 20、T-Head 18、Hygon 18。覆盖广，但各后端并不等齐。【源码】（`find src/native ...`）
+- 可选的“外部实现”层：`WITH_TORCH` 生成 ATen-backed 算子（实现槽位 8）；`WITH_LINKED` 把 vLLM/TVM FFI 等第三方库的符号/Dispatcher 接进来。这说明它的定位是“把不同来源的算子实现统一到一个调用面”，不是“把模型图编译成 kernel”。【文档】`/root/InfiniOps/docs/aten-operators.md:1-11,30-49`、`/root/InfiniOps/docs/linked-operators.md:3-6`
+
+**和 Triton 的关系**
+
+- 只有一条 Triton 路径：`src/triton/`，而且只有一个算子 `add`。它在运行时通过 pybind11 导入 Python 模块 `infini.triton.jit.compile`，用 Python 的 `triton` 编译 `@triton.jit` kernel，再把 cubin 加载回来；`compiler.cc` 明确要求“Python 解释器已初始化”，否则拒绝工作。【源码】`/root/InfiniOps/src/triton/jit/compile.py:10-17,158-195`、`/root/InfiniOps/src/triton/jit/compiler.cc:21-30,55-57`、`/root/InfiniOps/src/triton/ops/add/jit.py:5-17`
+- `WITH_TRITON` 要求 `WITH_NVIDIA=ON` 且 `GENERATE_PYTHON_BINDINGS=ON`；也就是说，Triton 只是 NVIDIA 后端上的一个可选 JIT provider，不是通用 IR/执行层。【源码】`/root/InfiniOps/CMakeLists.txt:432-445`
+- 其余 kernel 是手写 CUDA/C++ 或调用厂商库（cuBLASLt、FlashAttention、Marlin 等）；仓库内没有 `ttir`/`mlir` 字样。它不是“用 Triton 生成所有 kernel”的库。【源码】（`rg -ni "ttir|mlir"` 无结果）
+
+**和 NineToothed 的关系（一个已落地的一手案例）**
+
+InfiniOps 的 `WITH_NINETOOTHED` 是一个很好的参考：它在 **CMake configure 阶段**运行 `scripts/generate_ninetoothed_ops.py`，对 4 个算子（`rms_norm`、`fused_add_rms_norm`、`fused_qk_norm`、`fused_qk_rms_norm`）调用 `ninetoothed.build`，把生成的 C++ 源码编译进 InfiniOps；`ninetoothed.build` 使用 `caller="cuda"`、`lazy=False`，即 AOT 生成 `.so`/C++ 源码，而不是运行时 Python JIT。构建要求 `WITH_NVIDIA=ON`，并且 Python 环境里要有 `ninetoothed`、`ntops`、`triton`、`sympy`。【源码】`/root/InfiniOps/src/CMakeLists.txt:200-231`、`/root/InfiniOps/src/ninetoothed/ops/rms_norm/build.py:33-44`、`/root/InfiniOps/CMakeLists.txt:424-426`
+
+这说明 NineToothed 的真实定位是“kernel 作者用 DSL 写算子，再 AOT 成 C++/二进制给算子库用”；它并不负责“从 ONNX 图自动决定要生成哪些算子”。InfiniOps 仍然是人工列出 4 个算子并逐个 build。
+
+**有没有 ONNX 前端/模型转换能力**
+
+**没有。** 证据：
+
+- 仓库里 `onnx` 只出现在算子命名/语义对齐：`OnnxGather` 按 ONNX Gather-13 的语义实现，`Gemm` 按 ONNX schema 对齐；没有 `ModelProto`、`GraphProto`、opset、shape inference 的解析代码。【源码】`/root/InfiniOps/src/base/onnx_gather.h:8-10`、`/root/InfiniOps/docs/operator-api-alignment.md:3-4,31-32`
+- 没有 `ttir`/`mlir`；没有 `frontend`/`importer`/`graph IR` 模块。源码里的 “graph” 主要指 CUDA graph capture（`aclrtMalloc`、graph capture、stable workspace 等），不是神经网络图。【源码】（`rg -ni "graph|frontend" src` 结果均为运行时/CUDA graph 语境）
+- 没有模型加载、图切分、融合、内存规划、kernel 调度；它只有“算子级”的 `Handle`/`Config`/`Tensor`。
+
+**对本项目的价值**
+
+1. **作为“Triton 难以表达的算子”的 fallback 算子库：只能在 host 侧，不能在 TTIR 内。** TTIR 里没有“调用任意 C++ 算子”的通用 op；`tt.extern_elementwise` 只适合 elementwise 外部函数，不能表达 conv/attention 这类多张量、带 workspace 的算子。若要把 InfiniOps 当 fallback，架构上必须是“KernelPlan 在某些节点不生成 TTIR，而是由 host 调度 InfiniOps 调用”，这已经偏离“输出 TTIR”的目标，属于方案 C 的形态。【推断】
+2. **作为多后端 runtime/执行层：不完整。** InfiniOps 下面是 InfiniRT（device/stream/memory），上面没有图调度器、没有 manifest 驱动、没有模型加载。它可以作为“一串算子调用”的执行层，但项目仍要自己做 Graph IR、拓扑排序、buffer 生命周期和 launch 计划；这不是“拿来即用的 runtime”。【源码】`/root/InfiniOps/src/runtime.h:4,8-9`、`/root/InfiniOps/docs/api/operators.md:57-65`
+3. **是否值得在方案 B 的架构里预留接口：v0 不值得。** 如果未来产品目标从“输出 TTIR”扩展为“在 NVIDIA/Iluvatar/Hygon/Ascend 等多硬件上执行 ONNX 图”，那么 InfiniOps + InfiniRT 可以作为一个执行层候选；此时可以在 `KernelPlan`/runtime 层预留 `FallbackProvider`，但不应该让 v0 依赖它。理由是它的构建矩阵（InfiniRT + 厂商 SDK + 一次只能一个 GPU 后端）和 C++ ABI 会把 MVP 拖慢。【推断】
+
+**成熟度与风险**
+
+- 年轻：2026-02 创建，0.1.0，无 release；6 stars、83 open issues，说明公开使用少、问题面还在收敛。【检索】
+- 规模：`src/` 下约 1232 个 `.h/.cc/.cu` 文件，`tests/` 下 163 个 `test_*.py`；测试面广，但大量测试依赖具体硬件后端，不能简单等同于“全部后端都经过同等验证”。【源码】
+- 构建复杂：需要 InfiniRT 前缀；GPU 后端互斥（一次只能一个）；不同厂商 SDK（CUDA、DTK、MUSA、CANN、Neuware）；`WITH_TRITON` 还要 CUDA 12+ 和 Python 绑定；部分 provider（Marlin）要 C++20。【源码】`/root/InfiniOps/CMakeLists.txt:420-455`、`/root/InfiniOps/docs/backends.md:9-20`
+- 许可证：Apache-2.0，但 `LICENSES/` 和 `THIRD_PARTY.txt` 里还有 CUTLASS（BSD-3）、FasterTransformer（BSD-3）、FlashInfer、TVM FFI、InfiniCore（MIT）等第三方条款，分发时要一起审。【源码】`/root/InfiniOps/LICENSES/`、`/root/InfiniOps/THIRD_PARTY.txt`
+- 与本项目目标不匹配：它越靠近“多厂商算子实现”，越远离“ONNX → TTIR 转换器”；把它作为 v0 依赖会引入大量与 IR 无关的构建/ABI 风险。
+
+#### 3.4.3 两者的关系与净结论
+
+- **层次互补**：NineToothed 在“kernel 作者”一侧，负责把 tile 级程序变成某种后端源码；InfiniOps 在“算子库/执行”一侧，负责把多厂商实现统一到算子调用面。InfiniOps 已经用 NineToothed AOT 生成 4 个 norm 算子，说明“NineToothed → C++ 算子库”这条路是通的，但它仍是人工选算子，不是图级自动转换。
+- **都不解决本项目的主问题**：ONNX 图解析、opset 归一化、shape/type 推断、算子语义 lowering、kernel 划分/融合、TTIR 产出。NineToothed 能改善“kernel 怎么写”，InfiniOps 能改善“某些算子怎么在多硬件上跑”，但不能替代 Graph IR 和 ONNX lowering。
+- **对报告结论的影响**：不改变“社区没有成熟 ONNX → Triton IR 实现”的判断，也不改变“B-first, A-ready”的推荐；只是在方案 B 旁边增加一个可选变体 B′（§4.2.1），并在多硬件执行层保留一个未来评估项。
 
 ---
 
@@ -604,6 +745,68 @@ flowchart LR
 - 动态 shape：好（tile 级）；rank 必须静态。
 - 控制流：常量 If 容易；动态 If 可生成 `tl.where`/`scf.if`；通用 Loop/Scan 难。
 
+#### 4.2.1 变体 B′：生成 NineToothed DSL（评估后暂不采用）
+
+NineToothed 确实可以在“KernelPlan → 源码”这一段替换手写 Triton 模板，但它不改变整体架构，因此只构成 **B 的变体 B′**，不是独立方案。
+
+**数据流**
+
+```mermaid
+flowchart LR
+  O[.onnx] --> I[onnx importer]
+  I --> G[Graph IR]
+  G --> P[Partitioner / Fusion]
+  P --> K[KernelPlan]
+  K --> N[NineToothed codegen<br/>arrangement + application]
+  N --> S[NineToothed SSA<br/>ssa.Program]
+  S --> T[Triton Python source<br/>@triton.jit]
+  T --> C[ASTSource.make_ir + make_ttir]
+  C --> IR[.ttir]
+```
+
+关键点：NineToothed 的 Triton 后端输出仍然是 `@triton.jit` Python 源码（§3.4.1），所以 TTIR 仍由 Triton 前端生成；NineToothed 只是把“手写 Triton 源码”换成了“写 arrangement/application，再由它生成 Triton 源码”。【源码】`/root/ninetoothed/src/ninetoothed/backends/emitters/triton.py:712-744`
+
+具体落地方式：NineToothed 提供了 compile-only 的 `ninetoothed.compiler.lower(arrangement, application, tensors, backend="triton", write=True)`，它只做前端冻结 + SSA + backend emit，返回 `Artifact`，不初始化后端 runtime；`artifact.primary_source` 就是 `.triton.py` 文本。把它写盘并 import 出 `<name>_kernel`，再走 §1.2 路径 2 的 `ASTSource.make_ir` + `make_ttir` 得到 TTIR。做纯 IR 提取时应走 `lower()`，而不是默认会 materialize（JIT/AOT）的 `make()`。【源码】`/root/ninetoothed/src/ninetoothed/compiler/driver.py:236-281`
+
+**B 与 B′ 的对比**
+
+| 维度 | B：直接生成 Triton Python | B′：生成 NineToothed DSL |
+|---|---|---|
+| 中间表示 | 自己的 Graph IR → `KernelPlan` → Python 源码 | 自己的 Graph IR → `KernelPlan` → NineToothed `FrontendModule`/`ssa.Program` → Triton 源码 |
+| 抽象层次 | 低：指针、mask、`tl.arange`、广播都要自己写 | 高：`tile`/`expand`/`squeeze`/named axes 处理排布，`application` 只写 tile 内计算 |
+| 模板量 | 每个 ONNX op 一个 Triton 模板 | 每个 ONNX op 仍要一个 `application` 模板；但排布/边界代码可由 NineToothed 分担 |
+| 可控性 | 最高：生成的 Triton 源码可逐行改 | 较低：要改生成结果得改 NineToothed 的 SSA/emitter，或绕开它直接改产物 |
+| 调试 | 一层 codegen；报错定位在“我的模板”或 Triton 前端 | 两层 codegen；报错可能在 arrangement、application AST 解析、SSA pass、Triton emitter 或 Triton 前端 |
+| 依赖 | `onnx` + `triton` | 再加 `ninetoothed`（以及 `sympy`/`numpy`），并绑定其 0.x API |
+| Triton 版本风险 | 绑定 Triton | 仍然绑定 Triton，且多一个 `triton>=3.0.0` 的兼容区间 |
+| 多后端 | 只能出 Triton | 同一 SSA 可出 CUDA/TileLang/AscendC/BangC（但 AscendC/BangC 目前是 scalar baseline） |
+| AOT/部署 | 自己处理 | NineToothed 自带 `.so`/C++ 导出与 autotune |
+| 落地成本 | 3–5 人周（MVP） | 在 B 之上再加 2–4 人周做 emitter 适配与回归【推断】 |
+
+**B′ 的真实收益**
+
+1. **减少排布类样板代码**：`arrangement` 的 `tile/expand/squeeze/permute` 和 named axes 能把 matmul/reduction/attention 里大量广播与索引算术从生成器里挪走。【文档】`/root/ninetoothed/docs/source/basics.rst:37-67`、`/root/ninetoothed/docs/source/named_layout.rst:4-46`
+2. **更干净的编译边界**：`FrontendModule` 是冻结的、可验证的、与后端无关的 IR；同一份 module 可以换 dtype、换 target 再编译，不必重新跑 Python 前端。这比“拼字符串”更容易做缓存和回归。【源码】`/root/ninetoothed/src/ninetoothed/ir/module.py:15-30`、`/root/ninetoothed/docs/source/python_api/code_generation.rst:12-48`
+3. **自带 autotune 与 AOT**：`block_size()` 会生成调优候选，`ninetoothed.build` 可以预编译多组配置并导出 `.so`/C++ 头文件；如果项目以后需要“离线产物 + 运行时无 Python”，这是可复用的能力。【源码】`/root/ninetoothed/src/ninetoothed/compiler/driver.py:193-220`、`/root/ninetoothed/docs/source/build.rst:11`
+4. **多硬件后门**：如果未来要覆盖昇腾/寒武纪，NineToothed 已经有一套“同一 SSA 出不同后端”的框架；但当前 AscendC/BangC 只是 scalar baseline，性能不足以作为产品路径。【源码】`/root/ninetoothed/docs/source/ascendc.rst:18-43`
+
+**B′ 的关键限制**
+
+1. **仍然是“另一种模板”**：ONNX → kernel 的语义 lowering 工作一点没少；只是把“写 Triton”换成“写 arrangement/application”。它不能从 ONNX 自动推出 tile 形状或融合方案。
+2. **前端是 Python AST，不是稳定 API**：`application` 通过 `inspect.getsource` + `ast.parse` 解析，支持的是受限的 Python 子集；生成器必须产出合法、可被它识别的源码。若想绕开源码、直接构造 `FrontendModule`/`ssa.Program`，那是内部契约（文档只说“未来的 frontend 必须产出同样的 module 契约”，没有公开 builder）。【源码】`/root/ninetoothed/src/ninetoothed/frontend/python.py:70,96`、`/root/ninetoothed/docs/source/python_api/code_generation.rst:75-78`
+3. **0.x API 与发布滞后**：PyPI 0.26.0 落后 HEAD 36 个提交；`make`/`aot`/`build` 之上又加了 `Compiler`/`CompileRequest`，提交历史里多次重构 frontend/SSA。作为依赖必须固定 git commit，并承担升级成本。【源码】`git log v0.26.0..HEAD`
+4. **算子词汇表仍偏底层**：没有 conv/pool/softmax 高层 op；Conv 仍要 im2col + `linalg.matmul` 或手写循环，和方案 B 的工作量同级。【源码】`/root/ninetoothed/src/ninetoothed/ir/operations.py:444-468`
+5. **调试链路变长**：ONNX → NineToothed 源码 → SSA pass → Triton 源码 → TTIR；出现数值或编译错误时，定位成本高于 B。
+6. **生态偏 torch**：虽然核心依赖不强绑 torch，但默认 `caller="torch"`，示例/测试/autotune 都以 torch 为中心；本报告的环境是“无 torch、直接 cuda-python”，需要走 compile-only 路径或 AOT 路径。【源码】`/root/ninetoothed/src/ninetoothed/compiler/driver.py:201-212`
+
+**结论**
+
+B′ **暂不构成独立方案，也不建议作为 v0 主路径**。建议保留 B 的直接 Triton 生成，同时把 `KernelPlan → 源码` 定义成可替换的 `KernelEmitter` 接口；如果未来出现以下任一条件，再实现 B′：
+
+- 需要同时产出 CUDA/TileLang/AscendC/BangC 等多后端源码；
+- 手写 Triton 模板的排布/广播代码成为主要维护负担；
+- 需要 NineToothed 的 AOT `.so`/C++ 导出能力。
+
 ### 4.3 方案 C：逐算子手写 Triton kernel + 运行时图调度
 
 #### 数据流
@@ -678,6 +881,8 @@ flowchart LR
 | 长期可维护性 | 高（若版本稳定） | 中高 | 中 | 低 |
 
 > 工作量为**【推断】**，假设 1–2 名熟悉编译器的工程师，且已有 ONNX/Triton 环境。
+
+B′ 未在上表单列：它是 B 的 codegen 前端变体，除“抽象层/依赖/多后端”外与 B 同构；差异见 §4.2.1 的对比表。若只看出 TTIR 这一目标，B′ 的额外依赖和两级调试成本大于收益。【推断】
 
 ---
 
@@ -911,7 +1116,8 @@ ox2tt/
       conv.py
       shape_ops.py
     codegen/
-      python_emitter.py    # KernelPlan → Triton Python 源码
+      emitter.py           # KernelEmitter 接口：B / B′ 可替换实现
+      python_emitter.py    # KernelPlan → Triton Python 源码（方案 B）
       ttir_extract.py      # ASTSource.make_ir + make_ttir，或 triton.compile
       manifest.py
     runtime/
@@ -1012,6 +1218,7 @@ def extract_ttir(source_path: str, signature: dict, constexprs: dict,
 3. **保留方案 A 的接口**：把 `KernelPlan → TTIR` 做成一个可替换的 `TtirBackend` 接口。未来如果需要“无 Python 运行时”或更强的跨 op 融合，再实现 MLIR pass 后端；Graph IR、partition、lowering 表、测试全部复用。
 4. **不要一开始绑定 onnx-mlir**：ONNX 解析/形状推断用 `onnx` Python 包即可；onnx-mlir 作为参考实现和未来的 A 前端候选，而不是 v0 的硬依赖。
 5. **固定 Triton 3.8.0**（本机已安装），不要混用 `/root/triton` 的 3.6.0 源码；如果要从源码构建，先统一版本再谈。
+6. **暂不引入 NineToothed/InfiniOps**：v0 直接生成 Triton Python；把 `KernelPlan → 源码` 抽象成可替换的 `KernelEmitter`，未来若需要多硬件或更高层抽象，再增加 B′（NineToothed）实现。InfiniOps 只在产品目标扩展为“多硬件执行 ONNX 图”时评估，不作为 v0 依赖（见 §3.4、§4.2.1）。
 
 ### 7.2 为什么推荐 B
 
@@ -1040,6 +1247,11 @@ def extract_ttir(source_path: str, signature: dict, constexprs: dict,
 | 生成 Python 源码的注入/命名/缩进 bug | 中 | 中 | 用 AST 或严格模板；生成后 `compile()` 语法检查；单测 |
 | 输出契约不被下游接受 | 中 | 高 | 尽早和消费方确认；提供 manifest + 可执行验证；明确版本绑定 |
 | onnx-mlir 依赖导致构建复杂（若选 A） | 高 | 高 | v0 不依赖；A 阶段再评估 |
+| NineToothed API/版本漂移（若选 B′） | 中 | 中 | 固定 git commit；PyPI 0.26.0 落后 HEAD 36 个提交；封装 emitter 适配层；CI 回归 |
+| 两级 codegen 调试成本（若选 B′） | 中 | 中 | 保留直接生成 Triton 的 B 路径；对 B′ 产物做源码 diff + TTIR golden |
+| InfiniOps 构建矩阵与 InfiniRT 依赖（若接 fallback） | 高 | 中 | 仅在明确多硬件目标时引入；用独立进程/动态库隔离；不进入 v0 |
+| InfiniOps/C++ ABI 与 Tensor 约定不匹配 | 中 | 中 | 通过 host 侧 adapter 转换；不试图在 TTIR 内调用外部算子 |
+| 把“相邻工作”误当成 ONNX 前端（认知风险） | 中 | 中 | 明确分层：NineToothed=kernel 生成，InfiniOps=算子执行，ONNX 前端仍要自研 |
 
 ### 7.5 需要用户决策的点
 
@@ -1052,6 +1264,9 @@ def extract_ttir(source_path: str, signature: dict, constexprs: dict,
 7. **交付物**：只要 `.ttir`，还是需要 manifest + 可执行 runtime + cubin？
 8. **性能目标**：MVP 只要求正确，还是从一开始就要对标 ONNX Runtime/cuDNN？
 9. **依赖/license**：onnx-mlir（Apache-2.0）、Triton（MIT）、onnx（Apache-2.0）是否都可接受？
+10. **是否需要多硬件后端**：如果未来要覆盖 Ascend/寒武纪等，是否考虑 NineToothed 的 AscendC/BangC 后端（目前是 scalar baseline，性能不足）或 InfiniOps 的原生算子？这决定 B′ 是否值得做。
+11. **是否接受 NineToothed 作为编译期依赖**：它的 PyPI 版本落后 HEAD 36 个提交，必须固定 git commit；团队是否接受这种 0.x 依赖策略？
+12. **fallback 的层级**：如果某些算子 Triton 难以表达，fallback 放在 host 运行时（InfiniOps/PaddleTritonOps）还是直接标记“不支持”？前者会把项目从“IR 转换器”推向“多后端执行框架”。
 
 ---
 
@@ -1097,6 +1312,49 @@ onnx-mlir / ONNX：
 - `/root/llvm-project/mlir/include/mlir/Transforms/DialectConversion.h:41,1078,1517`
 - `/root/llvm-project/mlir/include/mlir/IR/PatternMatch.h:238,822`
 
+NineToothed（本地 `/root/ninetoothed`）：
+
+- `/root/ninetoothed/README.md:10,22-24`（TOM、arrange-and-apply）
+- `/root/ninetoothed/pyproject.toml:7,11,23-25`（版本、硬依赖、torch 仅为 extra）
+- `/root/ninetoothed/src/ninetoothed/make.py:6-41`（`make` 兼容入口）
+- `/root/ninetoothed/src/ninetoothed/compiler/driver.py:100-127,193-220,236-281`（`Compiler.compile`/`materialize`、`make`、compile-only `lower`）
+- `/root/ninetoothed/src/ninetoothed/frontend/module.py:16-33,73-83`（冻结 arrangement/application）
+- `/root/ninetoothed/src/ninetoothed/frontend/python.py:70,96`（`inspect.getsource` + `ast.parse`）
+- `/root/ninetoothed/src/ninetoothed/ir/ssa.py:16-87`（Type/Value/Operation/Block/Program）
+- `/root/ninetoothed/src/ninetoothed/ir/module.py:15-30`（`FrontendModule`）
+- `/root/ninetoothed/src/ninetoothed/ir/operations.py:444-468`（SSA op 注册表）
+- `/root/ninetoothed/src/ninetoothed/backends/core.py:11-26`（`Target` 枚举与默认后端）
+- `/root/ninetoothed/src/ninetoothed/backends/__init__.py:22-34`（五个后端注册）
+- `/root/ninetoothed/src/ninetoothed/backends/triton.py:29-40`（Triton backend capability）
+- `/root/ninetoothed/src/ninetoothed/backends/emitters/triton.py:58-62,712-744`（`python/triton` 输出与 `@triton.jit` 模板）
+- `/root/ninetoothed/src/ninetoothed/backends/materializers/triton.py:52-58,133-152`（JIT/AOT 物化）
+- `/root/ninetoothed/src/ninetoothed/backends/ascendc.py:9-20`、`/root/ninetoothed/docs/source/ascendc.rst:4-8,18-43`（AscendC baseline）
+- `/root/ninetoothed/docs/source/basics.rst:23-35,37-67,71-112`（符号张量、TOM、arrange-and-apply）
+- `/root/ninetoothed/docs/source/build.rst:11`（AOT `.so` / C++ 导出）
+- `/root/ninetoothed/docs/source/python_api/code_generation.rst:12-48,75-78`（冻结前端模块契约）
+- `/root/ninetoothed/docs/source/bangc.rst:4-7,38-40`（BangC baseline）
+- `/root/ninetoothed/docs/source/named_layout.rst:4-46`（named axes）
+
+InfiniOps（本地 `/root/InfiniOps`）：
+
+- `/root/InfiniOps/README.md:3,5-11,15-20`（定位、依赖、InfiniRT）
+- `/root/InfiniOps/CMakeLists.txt:420-455`（GPU 后端互斥、WITH_NINETOOTHED/WITH_TRITON 约束）
+- `/root/InfiniOps/src/CMakeLists.txt:200-231`（NineToothed configure-time codegen）
+- `/root/InfiniOps/src/operator.h:347,383`（`OperatorBase` / `Operator` 模板）
+- `/root/InfiniOps/src/dispatcher.h:109-121`（`DispatchFunc`）
+- `/root/InfiniOps/src/runtime.h:4,8-9`（InfiniRT 运行时）
+- `/root/InfiniOps/src/triton/jit/compile.py:10-17,158-195`（Triton JIT 编译与 kernel 加载）
+- `/root/InfiniOps/src/triton/jit/compiler.cc:21-30,55-57`（需要 Python 解释器）
+- `/root/InfiniOps/src/triton/ops/add/jit.py:5-17`（唯一的 Triton JIT 算子）
+- `/root/InfiniOps/src/ninetoothed/ops/rms_norm/build.py:33-44`（NineToothed AOT 集成）
+- `/root/InfiniOps/src/base/onnx_gather.h:8-10`（ONNX 仅用于语义对齐）
+- `/root/InfiniOps/docs/api/operators.md:6-45,57-65`（算子/实现布局、缓存）
+- `/root/InfiniOps/docs/backends.md:9-20,52-74`（后端选项与实现布局）
+- `/root/InfiniOps/docs/compatibility.md:8-36`（公共 API 与 InfiniRT 依赖边界）
+- `/root/InfiniOps/docs/linked-operators.md:3-6`（linked 第三方算子）
+- `/root/InfiniOps/docs/operator-api-alignment.md:3-4,31-32`（ONNX 语义对齐）
+- `/root/InfiniOps/LICENSES/`、`/root/InfiniOps/THIRD_PARTY.txt`（第三方许可证）
+
 ### 8.2 官方文档与规范
 
 - ONNX IR 规范：https://onnx.ai/onnx/repo-docs/IR.html
@@ -1128,6 +1386,12 @@ onnx-mlir / ONNX：
 - IBM/onnxmlir-triton-backend：https://github.com/IBM/onnxmlir-triton-backend
 - KernelLens：https://zenodo.org/records/23194523
 - onnx2torch：https://github.com/ENOT-AutoDL/onnx2torch
+- InfiniTensor/ninetoothed：https://github.com/InfiniTensor/ninetoothed
+- NineToothed 文档：https://ninetoothed.org/
+- PyPI ninetoothed：https://pypi.org/project/ninetoothed/
+- InfiniTensor/ntops（NineToothed 算子库）：https://github.com/InfiniTensor/ntops
+- InfiniTensor/InfiniOps：https://github.com/InfiniTensor/InfiniOps
+- InfiniTensor/InfiniRT：https://github.com/InfiniTensor/InfiniRT
 
 ---
 
@@ -1215,3 +1479,14 @@ cubin bytes: 4968
 | constexpr | Triton kernel 的编译期常量参数 |
 | `tt.func public` | TTIR 中的 kernel 入口函数 |
 | manifest | 本报告建议的产物清单，记录 kernel/grid/参数/依赖 |
+| TOM | Tensor-Oriented Metaprogramming，NineToothed 的张量元编程模型：张量在编译期只保存符号形状/步长 |
+| symbolic tensor / 符号张量 | NineToothed 中不持有数据、只持有符号表达式的 `Tensor` |
+| arrangement | NineToothed 的“排布”函数：在编译期对符号张量做 `tile`/`expand`/`squeeze`/`permute` 等元操作 |
+| application | NineToothed 的“应用”函数：定义每个 tile 上的计算，被编译器解析为 SSA |
+| arrange-and-apply | NineToothed 的编程范式：`arrangement` + `application` + `tensors` → `make` → kernel |
+| AscendC | 华为昇腾的 C/C++ 算子编程接口；NineToothed 的 AscendC 后端生成 AscendC 源码并调用 CANN CCEC |
+| BANG C | 寒武纪 MLU 的 C 方言；NineToothed 的 BangC 后端生成 BANG C 源码并调用 CNCC/CNRT |
+| TileLang | 另一套 tile 级 kernel DSL；NineToothed 提供 TileLang 后端 |
+| InfiniRT | InfiniTensor 的跨平台运行时库，提供 device/stream/memory 抽象；InfiniOps 的硬依赖 |
+| operator library / 算子库 | 按算子逐个提供实现与调度，不含图级编译/融合；InfiniOps 属于此类 |
+| AOT | Ahead-of-Time，提前编译；NineToothed 可把 kernel 编译为 `.so` 并导出 C++ 源码/头文件 |
