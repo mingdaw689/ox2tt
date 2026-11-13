@@ -1,8 +1,9 @@
 # ONNX → Triton IR 转换：一手资料调研与工程建议
 
-- 日期：2026-11-12（初版 2026-11-09；本次增补 `/root/ninetoothed` 与 `/root/InfiniOps` 调研）
-- 范围：ONNX 模型到 Triton IR（TTIR）的转换器架构选型，以及与 Triton 相邻的 DSL / 算子库生态
-- 方法：优先阅读本机源码（`/root/triton`、`/root/onnx-mlir`、`/root/triton-shared`、`/root/triton-linalg`、`/root/FlagTree`、`/root/PaddleTritonOps`、`/root/nkct`、`/root/llvm-project`、`/root/ninetoothed`、`/root/InfiniOps`），再核对官方文档与规范，并检索社区项目。另做了若干最小实测（见 §1.2 与附录 A）。star/PyPI 元数据于 2026-11-12 读取 GitHub REST API 与 PyPI JSON API。
+- 日期：2026-11-13（初版 2026-11-09；2026-11-12 增补 `/root/ninetoothed` 与 `/root/InfiniOps`；2026-11-13 增补 TPU-MLIR 调研）
+- 范围：ONNX 模型到 Triton IR（TTIR）的转换器架构选型，与 Triton 相邻的 DSL / 算子库生态，以及 TPU-MLIR 这一“ONNX → MLIR → 目标方言 → 目标二进制”的工业先例
+- 方法：优先阅读本机源码（`/root/triton`、`/root/onnx-mlir`、`/root/triton-shared`、`/root/triton-linalg`、`/root/FlagTree`、`/root/PaddleTritonOps`、`/root/nkct`、`/root/llvm-project`、`/root/ninetoothed`、`/root/InfiniOps`、`/root/tpu-mlir-master`），再核对官方文档与规范，并检索社区项目。另做了若干最小实测（见 §1.2 与附录 A）。star/PyPI 元数据于 2026-11-12 读取 GitHub REST API 与 PyPI JSON API；TPU-MLIR 的 GitHub 元数据于 2026-11-13 读取。
+- 论文来源：TPU-MLIR 相关的两篇论文（[Hu22] arXiv:2210.15016、[Hu26b] arXiv:2607.15865）由 Undermind 工作区 `3b3b20e4-1a7e-441c-bbfc-eaaa3c1ab060` 的 `/TPU-MLIR/` 文件夹提供；本报告对论文声称与当前源码实现分别标注。
 - 说明：本报告不引用任何既有内部 PoC 或其产物；所有结论仅基于本机一手源码、官方规范与本报告的独立实测。
 - 证据标记：
   - **【源码】** 本机源码可直接确认，给出 `路径:行号`
@@ -12,6 +13,7 @@
   - **【推断】** 基于以上事实的工程判断，不是事实陈述
 - 版本说明：本报告的 Triton 源码行号以 `/root/triton`（**3.6.0**）为准；本机实际安装的是 **3.8.0**。两者符号名与管线结构基本一致，但行号会偏移（例如 `add_stages` 在 3.8.0 中位于 `backends/nvidia/compiler.py:598`，在 3.6.0 中位于 `third_party/nvidia/backend/compiler.py:556`）。引用时请以符号名为主、行号为辅。
 - 增补版本：NineToothed 本地为 **0.26.0**（PyPI 同版本发布于 2026-06-30，本地 HEAD `4295e9c` 领先该 tag 36 个提交）；InfiniOps 本地为 **0.1.0**（无 release tag，HEAD `8b63a0f` 日期 2026-11-11）。
+- 2026-11-13 增补版本：TPU-MLIR 本地为 `/root/tpu-mlir-master`（无 `.git`，无法给出 commit）；GitHub `sophgo/tpu-mlir` 的 `pushed_at` 为 **2026-11-03**，本报告把它视作“2026-11 的 master 快照”。论文 [Hu22] 发表于 2022-10，二者相隔约四年，文中凡涉及新功能处均单独标注“当前 master”。
 
 ---
 
@@ -35,6 +37,7 @@
   - [3.2 社区项目现状](#32-社区项目现状)
   - [3.3 盘点结论](#33-盘点结论)
   - [3.4 NineToothed 与 InfiniOps 深入调研](#34-ninetoothed-与-infiniops-深入调研)
+  - [3.5 TPU-MLIR：ONNX → MLIR → TPU 的端到端编译器](#35-tpu-mlironnx--mlir--tpu-的端到端编译器)
 - [4. 可行架构方案对比](#4-可行架构方案对比)
   - [4.1 方案 A：基于 MLIR 的 ONNX → TTIR](#41-方案-a基于-mlir-的-onnx--ttir)
   - [4.2 方案 B：生成 Triton Python DSL，再编译得到 TTIR](#42-方案-b生成-triton-python-dsl再编译得到-ttir)
@@ -60,6 +63,7 @@
    - **2026-11-12 增补**：新调研的 NineToothed 是“Triton 之上的张量元编程 DSL / 多后端 kernel 生成器”，InfiniOps 是“跨平台 C++ 算子库”。两者分别处在 kernel 生成层和算子执行层，都没有 ONNX 图前端，也不直接产出 TTIR，因此不改变上述结论（详见 §3.4）。【源码】【检索】
 6. **推荐路线：B-first, A-ready**。先用“Python 图 IR + 生成 Triton DSL + 调 Triton 前端产出 TTIR”的方案拿到正确、可验证的 TTIR，再保留把 codegen 后端替换为 MLIR pass（方案 A）的接口。输出契约建议为“**每个 kernel 一个 `.ttir` 文件 + 一份 manifest.json**”，而不是一个巨大的单文件 TTIR。
    - **2026-11-12 增补**：NineToothed 不构成独立方案，只构成 B 的可选前端变体 B′（§4.2.1）。v0 仍直接生成 Triton Python；把 `KernelPlan → 源码` 做成可替换接口，以便未来插入 B′。InfiniOps 不进入 v0 依赖，只在“多硬件执行 ONNX 图”成为产品目标时评估（§7.1）。
+7. **2026-11-13 增补：TPU-MLIR 是“ONNX → MLIR → 目标方言 → 目标二进制”的成熟工业先例，但不是 ONNX → Triton 的实现**。它用两层方言把“框架无关的图语义（`top`）”与“芯片相关的 kernel/内存/量化（`tpu`）”分开，中间用 op interface 与分阶段 pass 衔接，并在每一层做数值验证；这套骨架对方案 A 的可行性是强证据，对方案 B 的 Graph IR/验证设计也有直接借鉴价值。但它的 target dialect、codegen 接口、layer group、内存分配与 bmodel/PyRuntime 全部绑定 SOPHGO TPU，**不能**直接复用到 Triton 后端。因此本报告的两条核心结论——“社区没有成熟的 ONNX → Triton IR 开源实现”与“B-first, A-ready”——**均不改变**（详见 §3.3、§3.5）。【源码】【检索】【推断】
 
 ---
 
@@ -452,6 +456,7 @@ ONNX 的 `ValueInfoProto` 里，shape 可以是：
 | `/root/llvm-project` | MLIR 基础设施 | `ConversionTarget`、`TypeConverter`、`RewritePattern`、`applyPartialConversion` | 活跃 | 方案 A 的基础设施 |
 | `/root/ninetoothed` | Triton 之上的张量元编程 DSL / 多后端 kernel 生成器 | TOM + arrange-and-apply；`ninetoothed.make` 先冻结为 `ssa.Program`，再由后端 emitter 生成 Triton/CUDA/TileLang/AscendC/BangC 源码；Triton 后端输出 `@triton.jit` Python 文件，**不是 TTIR**。无 ONNX 前端 | 活跃（471 stars；v0.26.0；HEAD 2026-11-02；PyPI 0.26.0 落后 HEAD 36 个提交） | **可选 codegen 前端（方案 B′）**；不解决 ONNX 语义 lowering；详见 §3.4.1 |
 | `/root/InfiniOps` | 跨平台 C++ 算子库 + 算子级调度 + Python 绑定 | 573 个 `src/base/*.h` 算子基类；CPU/NVIDIA/Iluvatar/Hygon/T-Head/MetaX/Mars/Moore/Cambricon/Ascend 后端；可选 ATen、Triton JIT（仅 `add`）、NineToothed AOT（4 个 norm 算子）；依赖 InfiniRT；**无图/ONNX 前端** | 活跃但年轻（6 stars；2026-02 起 322 个提交；无 release tag） | 仅可作为 host 侧 fallback 算子库/执行层候选；不能作为 TTIR 后端；详见 §3.4.2 |
+| `/root/tpu-mlir-master` | ONNX/PyTorch/TFLite/Caffe → MLIR（`top`/`tpu` 两层方言）→ `bmodel` | 129 个 ONNX op 映射（本报告统计）；`top` 200 个 op、`tpu` 187 个 op；`tpuc-opt` 驱动全部 pass；末段有 layer group、address assign、codegen；量化含 F32/BF16/F16/INT8/INT4/FP8；LLM 走 `llm_convert.py` | 活跃（1022 stars、231 forks，`pushed_at` 2026-11-03；本地为无 `.git` 快照） | **架构参考**：证明“语义层 + 目标层”两层 IR、op interface、分阶段数值验证在产品中可行；TPU 专用部分不可复用（§3.5） |
 
 补充事实：
 
@@ -480,6 +485,7 @@ ONNX 的 `ValueInfoProto` 里，shape 可以是：
 | [KernelLens](https://zenodo.org/records/23194523) | Triton kernel → ONNX/TensorRT 插件 | 新项目 | 反方向 |
 | [InfiniTensor/ninetoothed](https://github.com/InfiniTensor/ninetoothed) | Triton 之上的张量元编程 DSL / 多后端 kernel 生成器 | 471 stars，活跃，Apache-2.0，PyPI 0.26.0 | 不是 ONNX 前端，也不直接产出 TTIR；可作为方案 B′ 的 codegen 前端 |
 | [InfiniTensor/InfiniOps](https://github.com/InfiniTensor/InfiniOps) | 跨平台 C++ 算子库（算子级调度） | 6 stars，2026-02 创建，活跃但年轻，Apache-2.0 | 不是图编译器/ONNX 前端；只能在 host 侧作为 fallback 算子库 |
+| [sophgo/tpu-mlir](https://github.com/sophgo/tpu-mlir) | ONNX/PyTorch/TFLite/Caffe → MLIR → TPU | 1022 stars、231 forks，`pushed_at` 2026-11-03，活跃；2-Clause BSD（GitHub API 显示 `NOASSERTION`） | **不是答案**：目标方言是 TPU 专用，不产出 TTIR；**但参考价值高**：两层 IR、op interface、分阶段验证、显式权重/量化、按形状/阶段 specialization 都可迁移（§3.5） |
 | 中国专利 CN119336336B | ONNX → MLIR/Triton codegen | 专利，无开源实现 | 不可直接用 |
 
 另外，`Avi197/pytorch-to-onnx-to-triton` 之类的仓库名字容易误导，实际是 Triton Inference Server 的部署示例，不是编译器。【检索】
@@ -492,6 +498,7 @@ ONNX 的 `ValueInfoProto` 里，shape 可以是：
 4. **TTIR 作为编译输入是可验证的**：本报告独立实测了 `.ttir → TTGIR → LLIR → PTX → cubin`（见附录 A），因此“转换器输出 TTIR”在技术上成立；但 TTIR 的版本稳定性风险仍需单独管理。
 5. **PaddleTritonOps 证明了方案 C 的可行性**，但它不是转换器；它更适合作为“某些难算子的手写 kernel 后备库”。
 6. **2026-11-12 增补：出现了“Triton 之上的 DSL”与“跨平台算子库”两类相邻工作，但没有改变空白本身**。NineToothed 把 kernel 编写抽象为 arrange-and-apply，并在自己的 SSA IR 上支持多后端；InfiniOps 把多厂商算子实现收敛到统一 C++ 调度。两者都不解析 ONNX 图、不做图级融合、不产出 TTIR，因此“没有成熟的 ONNX → Triton IR 开源实现”仍然成立；它们分别对应“kernel 生成层”和“算子执行层”，而不是“图转换层”。【源码】【检索】
+7. **2026-11-13 增补：TPU-MLIR 是“ONNX → MLIR → 目标方言”的成熟先例，但它证明的是 MLIR 路线可行，不是 Triton 路径存在**。它把 ONNX 图降成 `top`（框架无关）再到 `tpu`（芯片相关），最后直接生成可部署的 `bmodel`；全程不经过 Triton，也没有 `tt` dialect 或 Triton 后端。它对本项目的意义是：①“两层 IR + op interface + 分阶段 pass”在工业产品中确实可维护；②“每一层都做数值对拍”是可行且必要的工程实践；③图级融合（如 `top.Mlp`/`top.FAttention`）可以保留到目标层，由后端决定怎么实现。它**没有**回答“ONNX 算子如何映射到 `tt` tile 原语”这个本项目的核心问题。【源码】【检索】【推断】
 
 ### 3.4 NineToothed 与 InfiniOps 深入调研
 
@@ -623,6 +630,414 @@ InfiniOps 的 `WITH_NINETOOTHED` 是一个很好的参考：它在 **CMake confi
 - **都不解决本项目的主问题**：ONNX 图解析、opset 归一化、shape/type 推断、算子语义 lowering、kernel 划分/融合、TTIR 产出。NineToothed 能改善“kernel 怎么写”，InfiniOps 能改善“某些算子怎么在多硬件上跑”，但不能替代 Graph IR 和 ONNX lowering。
 - **对报告结论的影响**：不改变“社区没有成熟 ONNX → Triton IR 实现”的判断，也不改变“B-first, A-ready”的推荐；只是在方案 B 旁边增加一个可选变体 B′（§4.2.1），并在多硬件执行层保留一个未来评估项。
 
+### 3.5 TPU-MLIR：ONNX → MLIR → TPU 的端到端编译器
+
+本节回答三个问题：TPU-MLIR 到底是什么；它的哪一层设计值得 ONNX → Triton 项目借鉴；哪些部分只能留在 TPU 上。先给结论：**它是一个成熟的“框架图 → 两层 MLIR 方言 → 目标二进制”编译器，验证了 MLIR 分层路线在产品中可行，但它的目标方言、代码生成与运行时全部是 SOPHGO TPU 专用，不能直接产出 TTIR**。【源码】【检索】【推断】
+
+本节严格区分三种证据来源：
+
+- **[Hu22] 论文声称**：arXiv:2210.15016（2022-10-23 提交，v2）；描述 2022 年的设计。
+- **[Hu26b] 论文声称**：arXiv:2607.15865（2026-07-17 提交，v2）；描述 LLM 编译扩展。
+- **当前 master 源码**：`/root/tpu-mlir-master`，对应 GitHub `pushed_at` 2026-11-03。凡论文没写、源码里有的功能，都标注“当前 master”。
+
+#### 3.5.1 定位与整体架构
+
+**基本事实**
+
+- 仓库：[sophgo/tpu-mlir](https://github.com/sophgo/tpu-mlir)，默认分支 `master`，创建于 2022-06-03；2026-11-13 通过 GitHub REST API 读到 **1022 stars、231 forks、115 open issues、`pushed_at` 2026-11-03**。【检索】
+- 许可证：`LICENSE:1-5` 声明为 **2-Clause BSD**（GitHub API 的 `license.spdx_id` 为 `NOASSERTION`，因为文件是自定义措辞）。【源码】【检索】
+- 本地快照 `/root/tpu-mlir-master` 没有 `.git`，因此本报告只能给“2026-11 的 master 快照”，不能给 commit hash。
+- README 的定位：把主流框架的预训练网络转换为可在 SOPHGO TPU 上运行的 `bmodel`；强调多前端、LLM、完整量化工具链、MLIR 管线与生产工具。【文档】`README.md:29-46`、`README_cn.md:30-41`
+
+**整体数据流**
+
+```mermaid
+flowchart LR
+  F[ONNX / PyTorch / TFLite / Caffe] --> C[Python 前端<br/>python/transform]
+  C --> TOP[top dialect<br/>框架无关图语义]
+  TOP -->|shape-infer / canonicalize / extra-optimize| TOP
+  TOP -->|import-calibration-table| TOP
+  TOP -->|convert-top-to-tpu| TPU[tpu dialect<br/>芯片相关 kernel/量化/切片]
+  TPU -->|layer-group| TPU
+  TPU -->|address-assign| TPU
+  TPU -->|codegen| BM[bmodel<br/>flatbuffers]
+  BM --> RT[PyRuntime / model_runner<br/>bindings/pyruntime]
+```
+
+**论文图 1 与源码目录的对应**
+
+| 论文阶段（[Hu22]） | 当前 master 的落点 | 证据 |
+|---|---|---|
+| 前端转换（ONNX → TOP MLIR） | `python/transform/OnnxConverter.py`、`MLIRImporter.py` | `OnnxConverter.py:107,499,727` |
+| TOP canonicalization | `tpuc-opt --shape-infer --canonicalize --extra-optimize`；模式在 `lib/Dialect/Top/Canonicalize/` | `python/utils/mlir_shell.py:508-517`、`lib/Dialect/Top/Transforms/ExtraOptimize.cpp:38-66` |
+| TOP calibration | `python/tools/run_calibration.py` + `--import-calibration-table` | `run_calibration.py:32-87`、`ImportCalibration.cpp:20-23` |
+| ConvertTopToTpu | `lib/Conversion/TopToTpu/`（按芯片分子目录） | `include/tpu_mlir/Conversion/Passes.td:19-22` |
+| layer group | `lib/Dialect/Tpu/Transforms/LayerGroup/` | `Passes.td:52-76`、`LayerGroup.cpp:67-70` |
+| memory assign | `lib/Dialect/Tpu/Transforms/AddressAssign/BMAddressAssign.cpp` | `BMAddressAssign.cpp:1022-1025` |
+| TPU codegen / bmodel | `lib/Dialect/Tpu/Transforms/Codegen/BM168xCodegen.cpp`、`lib/Builder/bmodel.cpp` | `Codegen.cpp:18-66`、`bmodel.cpp:28-31` |
+| PyRuntime 执行 | `bindings/pyruntime/pyruntime_bm.cpp`、`python/tools/model_runner.py` | `pyruntime_bm.cpp:1-30`、`model_runner.py:460-475` |
+
+**各角色的职责**
+
+- **前端**：把框架模型翻译成 `top` 方言的 MLIR 文本 + 独立权重 `.npz`。前端不是通用 IR，而是逐 op 的 Python 映射表。【源码】`OnnxConverter.py:176,727-796`
+- **`top` 方言**：框架无关的图语义层。它保留卷积、池化、MatMul、Attention、Mlp 这类高层 op，携带 shape/type/属性，并提供 shape inference、FLOPs 统计等接口。【源码】`TopOps.td:35-42,296-301`
+- **`tpu` 方言**：芯片相关层。它携带量化后的类型、layer group 属性（切片索引、lmem buffer 地址/大小）、全局内存地址，并为每个 op 实现“全局/本地 codegen”接口。【源码】`TpuOps.td:43-47,107-134,423-429`
+- **`bmodel`**：最终可部署二进制，flatbuffers 格式，当前 `BMODEL_VERSION` 为 `2.2`，magic 为 `0xFF55AAEE`。【源码】`lib/Builder/bmodel.cpp:28-31`
+- **PyRuntime**：bmodel 的 Python 运行时绑定，通过 `bmruntime_interface.h` 加载模型、绑定输入输出、执行推理；`model_runner.py` 在此之上提供 `bmodel_inference` 等入口。【源码】`bindings/pyruntime/pyruntime_bm.cpp:14-30`、`python/tools/model_runner.py:460-475`
+- **目标芯片**：`regression/chip.py` 列出 `bm1684x`、`bm1688`、`bm1690`、`bm1690e`、`cv84x6`、`cv180x/cv181x/cv182x/cv183x`、`cv184x`、`cv186x`、`cv190x`、`sgtpuv8` 等；不同芯片的量化模式支持矩阵不同（INT8 对称/非对称、INT4、FP8）。【源码】`regression/chip.py:24-40`、`CLAUDE.md` 的 chip 列表
+
+**当前 master 相对 2022 论文新增了什么**
+
+| 维度 | [Hu22] 论文 | 当前 master | 证据 |
+|---|---|---|---|
+| 前端 | 主要是 ONNX，其他框架先转 ONNX | ONNX、PyTorch、TFLite、Caffe，另有 TpuLang/MaskRCNN 专用前端 | `python/transform/` 目录、`CLAUDE.md` |
+| 芯片 | 初期只支持 SOPHGO（论文自述） | 多代 BM/CV 芯片，含多核（bm1690 8 核、bm1688 2 核） | `regression/chip.py:24-49` |
+| 量化 | F32/BF16/F16/INT8 | 追加 INT4、FP8（e4m3/e5m2）、AWQ/GPTQ/AutoRound 透传、QAT | `chip.py:24-40`、`README.md:39-42`、`python/tools/deploy_qat.py` |
+| LLM | 未涉及 | `llm_convert.py` + `python/llm/`（35 个 Python 文件，多模型 Converter）；分 prefill/prefill_kv/decode 阶段 | `python/tools/llm_convert.py:129-207`、`python/llm/LlmConverter.py:2505-2527` |
+| 动态 shape | 论文未展开 | `--dynamic`；`top.Input` 支持 `shape_tensor` | `llm_convert.py:187-188`、`TopOps.td:260-272` |
+| 调试/验证 | 论文只描述数值对拍 | `python/debugger/`（按芯片分 target 目录）、`python/eval/`、`regression/` | `python/debugger/`、`python/eval/model_inference.py` |
+
+> **不要用论文覆盖新版源码**：论文说的“初期只支持 SOPHGO 芯片”“没有完整算子覆盖表”“校准只针对 INT8”，描述的是 2022 年的状态；当前 master 已明显扩展。反过来，也不能用新版源码反推论文写过什么。
+
+#### 3.5.2 两层方言：TOP 与 TPU
+
+**方言定义**
+
+- `top`：`def Top_Dialect : Dialect { let name = "top"; ... }`，C++ namespace `::tpu_mlir::top`。【源码】`TopOps.td:35-42`
+- `tpu`：`def Tpu_Dialect : Dialect { let name = "tpu"; ... }`，C++ namespace `::tpu_mlir::tpu`，summary 明确写“for the SOPHGO Deep Learning processors”。【源码】`TpuOps.td:43-47`
+
+**规模（本报告统计）**
+
+| 方言 | op 数 | 统计方式 |
+|---|---|---|
+| `top` | 200 | `rg '^def Top_\w+Op :' TopOps.td` |
+| `tpu` | 187 | `rg '^def Tpu_\w+Op :' TpuOps.td` |
+| ONNX 前端映射 | 129 | `OnnxConverter.py` 的 `onnxop_factory` 条目数 |
+
+注意：这里的“200/187”是 op 定义数，不等于“完整覆盖 ONNX 200+ 算子”；ONNX 的很多算子会被前端拆成多个 `top` op，或由 `top` 的 canonicalization 合并。
+
+**两类接口：为什么分两层**
+
+`top` 与 `tpu` 的 op 基类直接体现了职责划分：
+
+```tablegen
+// TopOps.td:296-301
+class Top_Op<string mnemonic, list<Trait> traits = []> :
+    Top_BaseOp<mnemonic, !listconcat(traits,
+       [DeclareOpInterfaceMethods<InferenceInterface>,
+        DeclareOpInterfaceMethods<FlopsInterface>,
+        DeclareOpInterfaceMethods<ShapeInterface>])>;
+```
+
+```tablegen
+// TpuOps.td:423-429
+class Tpu_Op<string mnemonic, list<Trait> traits = []> :
+    Op<Tpu_Dialect, mnemonic, !listconcat(traits,
+       [TpuTypeRestrict,
+       DeclareOpInterfaceMethods<GlobalGenInterface>,
+       DeclareOpInterfaceMethods<InferenceInterface>,
+       DeclareOpInterfaceMethods<DynGlobalGenInterface>])> ;
+```
+
+| 接口 | 定义位置 | 作用 | 属于哪一层 |
+|---|---|---|---|
+| `InferenceInterface` | `include/tpu_mlir/Interfaces/InferenceInterface.td:15-53` | `inference(param)`、`init/deinit`、`backward_weight`；形状/常量推断与参考实现 | 两层都有 |
+| `FlopsInterface` | `include/tpu_mlir/Interfaces/FlopsInterface.td` | 统计 FLOPs | `top` |
+| `ShapeInterface` | `include/tpu_mlir/Interfaces/ShapeInterface.td` | `shape_inference()`，补全结果类型 | `top` |
+| `GlobalGenInterface` | `include/tpu_mlir/Interfaces/GlobalGenInterface.td:15-56` | `codegen_global_bm1684/bm1684x/cv18xx`、`support_multi_core` | `tpu` |
+| `LocalGenInterface` | `include/tpu_mlir/Interfaces/LocalGenInterface.td:15-395` | `codegen_local_*`、`assign_sec_info_kernel`、`BackwardH/N/D/W/C`、`getBufferSize_*` | `tpu`（layer group 内） |
+| `DynGlobalGenInterface` / `DynLocalGenInterface` | `Interfaces/Dyn*GenInterface.td` | 动态 shape 版本的 codegen | `tpu` |
+| `IndexingMapsInterface` / `TypeInterface` / `InplaceInterface` | `Interfaces/` | 索引映射、类型约束、原地复用 | `tpu` |
+
+**分层带来的直接好处**
+
+1. **前端不需要知道芯片**：ONNX 前端只产出 `top` op；`top` op 的语义、shape 推断、常量折叠与目标芯片无关。
+2. **量化被隔离在 lowering**：校准表在 `top` 层以 `threshold/min/max` 属性导入（`ImportCalibration.cpp:20-23,107-113`），真正的量化类型、multiplier/shift、round mode 在 `convert-top-to-tpu` 时才确定（`TopToTpuPass.cpp:1558,1966`）。
+3. **芯片差异被收敛到 lowering 目录**：同一 `top.Conv` 在 `lib/Conversion/TopToTpu/BM1684/`、`BM1684X/`、`CV18xx/` 下各有实现；新增芯片主要是加一个目录 + 一套 codegen 接口实现。【源码】`lib/Conversion/TopToTpu/` 目录结构
+4. **融合可以跨层表达**：`top` 保留 `Attention`、`FAttention`、`Mlp` 等高层融合 op（`TopOps.td:721,2359,4313`），`tpu` 层有对应实现（`TpuOps.td:846,2864,5248`）；这样“是否融合”是图层的决策，“融合后怎么生成指令”是目标层的决策。
+
+**哪些信息属于 TOP，哪些属于 TPU**
+
+| 信息 | TOP | TPU | 证据 |
+|---|---|---|---|
+| 逻辑 shape / dtype（F32） | 是 | 是（可能已转 F16/BF16/INT8） | `TopOps.td:296-301`、`TpuOps.td:423-429` |
+| op 语义与属性（pads/strides/axis…） | 是 | 是（部分属性被 lower 成芯片参数） | `Top_ConvOp`、`Tpu_ConvOp` 定义 |
+| 校准阈值 min/max | 是（作为属性导入） | 转化为 scale/zero-point/multiplier | `ImportCalibration.cpp:107-113`、`TopToTpuPass.cpp:1966` |
+| 量化后的存储类型 | 否 | 是 | `TpuOps.td` 的 `DqTypeAttr`（含 `F16/BF16/INT8/INT4/F8E4M3/...`） |
+| 切片索引与 lmem buffer 地址/大小 | 否 | 是（`Tpu_LayerGroupAttr`） | `TpuOps.td:107-134` |
+| 全局内存地址 | 否 | 是（address-assign 写入） | `BMAddressAssign.cpp:1022-1025` |
+| 芯片指令 | 否 | 是（codegen 接口按芯片分方法名） | `GlobalGenInterface.td:20-45` |
+
+> 对照论文：[Hu22] 说 TOP op 有 `InferenceInterface`/`FlopsInterface`、TPU op 有 `GlobalGenInterface`/`InferenceInterface`，这一点在当前源码仍然成立；当前源码额外加了 `ShapeInterface`、`Dyn*GenInterface`、`LocalGenInterface`、`IndexingMapsInterface`、`TypeInterface`、`InplaceInterface`，属于四年间的演进。
+
+#### 3.5.3 ONNX 前端与 Graph IR
+
+**入口与调用链**
+
+```text
+model_transform.py
+  └─ OnnxConverter(...)                      # OnnxConverter.py:107
+       ├─ load_onnx_model(...)               # :499
+       │    ├─ onnx.load / select_output
+       │    ├─ input_shape_assign / model_simplify
+       │    │    ├─ ConstantFolding(...)     # OnnxOpt.py
+       │    │    └─ onnxsim.simplify(...)    # :452-470
+       │    └─ onnx_opt(...)                 # :499-561，做算子融合/常量折叠
+       ├─ init_MLIRImporter()                # MLIRImporter
+       └─ generate_mlir(mlir_file)           # :727
+            ├─ create_input_op(...)          # 每个 graph input
+            ├─ for node in graph.node: onnxop_factory[op_type](node)  # :781
+            ├─ create_return_op(...)
+            ├─ print_module() → *_origin.mlir
+            └─ WeightToNpz(...) → *_top_origin_weight.npz
+```
+
+**节点如何映射成 `top` op**
+
+- `self.onnxop_factory` 是一个 `dict[str, lambda node: self.convert_xxx_op(node)]`，共 129 个条目，大体按字母序排列（`"Abs"` 在首，`"If"`/`"Loop"` 等控制流 op 排在末尾）。【源码】`OnnxConverter.py:176-450`
+- 依赖的设施：`onnx`（解析/保存/proto）、`onnxsim`（图简化）、`onnxruntime`（动态 shape 时跑测试输入）、`numpy`（权重），以及 TPU-MLIR 构建产物 `mlir.dialects.top` 的 Python binding（`OnnxConverter.py:8-21`）。前端不是拼 MLIR 文本，而是用 binding 直接构造 `Operation`；`MLIRImporter` 里也能看到 `Operation.create("top.Weight", ...)` 这种底层用法（`MLIRImporter.py:247-268`）。【源码】
+- 每个 `convert_xxx_op` 直接调用 Python binding 创建 `top` op，例如：
+
+```python
+# OnnxConverter.py:1017-1033（convert_conv_op 的实际结尾）
+new_op = top.ConvOp(self.unranked_type,
+                    *operands,
+                    kernel_shape=kernel_shape,
+                    strides=strides,
+                    dilations=dilations,
+                    auto_pad=StringAttr.get(auto_pad),
+                    pads=pads,
+                    group=group,
+                    weight_is_coeff=weight_is_coeff,
+                    do_relu=False,
+                    loc=self.get_loc("{}_{}".format(onnx_node.name, onnx_node.op_type)),
+                    ip=self.mlir.insert_point).output
+self.addOperand(onnx_node.name, new_op)
+```
+
+- 属性翻译由 `convert_onnx_attribute_proto` 和 `onnx_attr_translator` 完成；`axis/axes/dtype/keepdims/to` 有专门转换。【源码】`OnnxConverter.py:29-58`
+- 子图（`If`/`Loop`）用 `create_if_op`/`create_loop_op` 创建带 region 的 op，再递归 `parse_subgraph`。【源码】`OnnxConverter.py:3528-3575`
+- 前端**不支持的 op 直接报错**：先扫描所有节点，收集 `unsupported` 集合，再 `raise RuntimeError("Op not support:{}")`；单节点分派时也有 fallback `NoneAndRaise`。【源码】`OnnxConverter.py:773-781`、`752`
+
+**shape 与类型怎么处理（这是最容易误判的一点）**
+
+- 前端为大多数 op 传入的结果类型是 **`UnrankedTensorType`**：`self.unranked_type = self.mlir.get_tensor_type([])`（`OnnxConverter.py:140`），而 `get_tensor_type([])` 返回 `UnrankedTensorType.get(type)`（`MLIRImporter.py:167-173`）。也就是说，**前端主要负责“建图”，不负责把每个结果 shape 都算准**。
+- 真正的 shape/type 由 C++ 的 `shape-infer` pass 完成：它遍历 `ShapeInterface` 调 `shape_inference()`，再遍历 `InferenceInterface` 触发 `WeightFolder` 和类型更新。【源码】`lib/Dialect/Top/Transforms/ShapeInfer.cpp:207-238`
+- 动态 shape：`--dynamic`、`dynamic_shape_input_names`、`shape_influencing_input_names`；后者的输入会作为 `top.Input` 的 `shape_tensor` 属性传入（`TopOps.td:260-272`），并在 `generate_mlir` 中从 `test_input.npz` 读取。【源码】`OnnxConverter.py:109-140,727-750`、`MLIRImporter.py:218-246`
+- ONNX 侧的 shape inference 由 `OnnxOpt.infer_shapes()` 调 `onnx.shape_inference.infer_shapes` 完成（`OnnxOpt.py:354-359`）；`onnxsim.simplify` 显式传 `skip_shape_inference=True`（`OnnxConverter.py:452-470`），避免与自己的流程冲突。
+
+**权重怎么处理**
+
+- 所有 `graph.initializer` 在 `load_onnx_model` 中读成 `numpy` 并 `addWeight(name, data)`；值统一 `astype(np.float32)`（源码注释也承认 quantized ONNX 尚未保留原类型）。【源码】`OnnxConverter.py:519-529`
+- 建图时通过 `getWeightOp(name)` 创建 `top.Weight` op；`top.Weight` 不持有数据，而是**按 loc 名字引用 `.npz` 文件**，支持 `path` 与 `inline_bytes` 两种模式。【源码】`BaseConverter.py:106-126`、`MLIRImporter.py:247-268`、`TopOps.td:195-206`
+- 最后 `WeightToNpz(weight_file)` 只保存“实际被 op 引用”的 tensor，文件名形如 `<model>_top_origin_weight.npz`。【源码】`BaseConverter.py:128-133`、`OnnxConverter.py:140`
+
+**算子覆盖与限制（前端层面）**
+
+- 129 个 ONNX op 有显式映射；不在表里的 op 直接失败，没有通用 fallback。
+- 没有内置 opset 归一化：代码只读取 `opset` 再按版本分支（例如 Softmax 默认 axis 在 opset 13 前后不同，`OnnxConverter.py:1904`），**不调用** `onnx.version_converter`。这与本报告 §2.2 的建议不同；模型需先自行转成目标 opset。【源码】【推断】
+- `Scan` 没有 converter（`rg '"Scan"' OnnxConverter.py` 无结果）；`If`/`Loop` 有 converter，但依赖后端对 region 的支持。
+- 部分 op 有硬限制：例如 `CumSum` 只支持 constant axis（`OnnxConverter.py:3615`）；控制流、动态 reshape 等仍受目标后端约束。
+- 自定义 domain（如 `ai.onnx.ml`）不在映射表里；只有默认 domain 的 opset 会被记录（`OnnxConverter.py:156-160`）。
+
+#### 3.5.4 Pass pipeline 与代码生成
+
+TPU-MLIR 的所有 pass 都由 `tpuc-opt` 驱动，Python 侧只是拼命令行。完整链路可以在 `python/utils/mlir_shell.py` 中逐段读到。
+
+**阶段 1：TOP 图优化（`model_transform.py`）**
+
+```text
+tpuc-opt <origin.mlir> --struct-optimize --shape-infer [--add-postprocess=...] \
+        --canonicalize --extra-optimize -o <top.mlir>
+```
+
+【源码】`mlir_shell.py:508-517,518-540`；`model_transform.py:64-90` 调用 `mlir_opt_for_top`
+
+各 pass 的职责（官方开发者手册也有说明）：
+
+| pass | 作用 | 实现 |
+|---|---|---|
+| `struct-optimize` | 针对 CLIP 等模型的结构预优化 | `lib/Dialect/Top/Transforms/StructOptimize.cpp` |
+| `shape-infer` | shapes/types 推断 + 常量折叠 | `ShapeInfer.cpp:207-238` |
+| `canonicalize` | 逐 op 图优化，如 Conv+ReLU 合并、BatchNorm 消除、Reshape 合并 | `lib/Dialect/Top/Canonicalize/`（50+ 文件） |
+| `extra-optimize` | 去未用输出、合并同 op、weight fold、统计 FLOPs | `ExtraOptimize.cpp:38-66` |
+
+> 论文与源码的差异：[Hu22] 举例说 TOP canonicalization 会把 **BN 转成 depthwise conv**；当前 master 的 `TopBatchNormToScale` 把 BN 折叠成 `top.Scale`（用 scale/bias 两个 weight 替代 gamma/beta/mean/var），见 `lib/Dialect/Top/Canonicalize/BatchNorm.cpp:14-70`。两者都是“把 BN 消掉”，但目标 op 不同。**以当前源码为准，不能把论文的例子当成现状。**
+>
+> Conv+ReLU 的融合在源码里由 trait 标记 + lowering 吸收：`SupportFuseRelu` 定义在 `Traits.td:25`，`top.Conv`/`top.MatMul`/`top.Add` 等声明该 trait（`TopOps.td:1507,3935,559`），`ConvertTopToTpu::relu_process()` 在量化场景设置 `relu_limit`（`TopToTpuPass.cpp:2110-2122`）。【源码】
+
+**阶段 2：TOP → TPU lowering（`model_deploy.py`）**
+
+```text
+tpuc-opt <top.mlir> \
+  --processor-assign="chip=bm1684x mode=F16 num_device=1 num_core=1 addr_mode=auto high_precision=false" \
+  [--import-calibration-table="file=... asymmetric=false"] \
+  --processor-top-optimize [--fuse-preprocess=...] \
+  --convert-top-to-tpu="weightFileName=... asymmetric=false doWinograd=false q_group_size=0 ..." \
+  --canonicalize --weight-fold -o <tpu.mlir>
+```
+
+【源码】`mlir_shell.py:543-590`（`lowering_options`）、`592-642`（`mlir_lowering`）、`model_deploy.py:256-295`
+
+`ConvertTopToTpu` 是核心 lowering pass：
+
+- 入口 `ConvertTopToTpu::runOnOperation()`：`lib/Conversion/TopToTpu/TopToTpuPass.cpp:1558`
+- 校准处理 `calibration_process()`：`:1966`
+- host/device 类型转换、cast 插入：`:2085-2148`
+- 量化模式 `qmode()` / `init_qtable()`：`:2514,2525`
+- 按芯片分目录：`lib/Conversion/TopToTpu/{BM1684,BM1684X,CV18xx}/`
+
+**阶段 3：TPU 图变换（layer group / 内存 / 并行）**
+
+```text
+tpuc-opt <tpu.mlir> \
+  --dev-parallel --weight-reorder [--op-divide] --subnet-divide --op-reorder \
+  [--topo-sort] [--layer-group="opt=2 ..."] [--affine-opt] [--trunc-layer=...] \
+  --core-parallel [--opt-post-processor] --after-layergroup-weight-reorder \
+  [--weight-deduplicate] --address-assign -o <final.mlir>
+```
+
+【源码】`mlir_shell.py:667-760`（`tpu_ada_options`）
+
+| 阶段 | 作用 | 实现位置 |
+|---|---|---|
+| `weight-reorder` | 按芯片要求重排卷积 filter/bias 等权重 | `lib/Dialect/Tpu/Transforms/WeightReorder/` |
+| `subnet-divide` | 按处理器切子网（多设备/多核） | `Passes.td:33-41` |
+| `topo-sort` | 减少 base group 数量 | `Passes.td:43-50` |
+| `layer-group` | 按 N/H 维切片，让尽量多的 op 在 LMEM 中连续执行 | `Passes.td:52-76`、`lib/Dialect/Tpu/Transforms/LayerGroup/` |
+| `address-assign` | 给 GMEM 张量分配/复用地址 | `Passes.td:95-117`、`AddressAssign/BMAddressAssign.cpp:1022-1025` |
+| `codegen` | 生成指令与 flatbuffers bmodel | `Passes.td:139-157`、`Codegen.cpp:18-66` |
+
+**layer group 的具体实现**
+
+- 入口 `LayerGroupPass::runOnOperation()`：`lib/Dialect/Tpu/Transforms/LayerGroup.cpp:67-70`
+- pass 选项：`opt=1` 尽量多分组，`opt=2` 用动态规划分组；还有 `group_by_cores`、`compress_mode`、`debugger`、`disable_group_overlap` 等（`Passes.td:52-76`）。
+- 目录 `lib/Dialect/Tpu/Transforms/LayerGroup/` 下有：`LmemAllocator.cpp`（LMEM 分配/复用）、`GroupMethod.cpp`（分组方法）、`CycleCalculator.cpp`（周期/代价）、`SwPipeline.cpp`（软件流水）、`TimeStepMethod.cpp`、`GroupOverlap.cpp`、`BasicTimeStep.cpp` 等。
+- 文档说明了两件事：① 只切 N/H（`10_layergroup.rst:5-20`）；② Conv/Pool 需要 `BackwardH` 来计算输入切片（`10_layergroup.rst:22-40`）。`LocalGenInterface` 里的 `BackwardH/BackwardN/BackwardD/BackwardW/BackwardC` 就是为此存在（`LocalGenInterface.td`）。
+
+**memory assign 的具体实现**
+
+- 入口在 `lib/Dialect/Tpu/Transforms/AddressAssign/BMAddressAssign.cpp`；核心是 `GmemAllocator`：按 live range 排序后 `assignGaddr(common_ops, liveRange, reuse_addr, start_addr)`（`:1022-1025`），L2 SRAM 另有一路 `GmemAllocL2SRAM`（`:500-511`）。
+- 文档 `11_memassign.rst:4-10` 写得很直白：先给 weight 按 4K 对齐分配，再按全局 neuron tensor 的生命周期复用；复用的 5 个条件包括“不在 hold_edges”“地址不在 in_using_addr”“已 EOL”“空间足够”“不与当前 op 的输入地址冲突”。
+
+**codegen 的具体实现**
+
+- `CodegenPass::runOnOperation()` 先断言 `module::isState(TPU_ADDRESSED)`，再按 CV18xx / BM168x 分流：CV18xx 走 `CviModelBuilder`，BM 系列走 `BMCodegen::init/run/store`。【源码】`lib/Dialect/Tpu/Transforms/Codegen.cpp:18-66`
+- `BMCodegen` 在 `lib/Dialect/Tpu/Transforms/Codegen/BM168xCodegen.cpp`：`init`（`:102-137`）、`run`（`:139-333`）、`store`（`:335-...`）。
+- 最终 bmodel 由 `lib/Builder/bmodel.cpp` 用 flatbuffers 写出（`bmodel.cpp:11-31`）。
+- 官方文档把 codegen 分成“指令生成 / 指令存储 / 指令取回”三步，并把 BDC（TIU）与 GDMA 指令缓冲作为核心数据结构（`12_codegen.rst:8-40`）。【文档】
+
+#### 3.5.5 量化、验证与回归
+
+**量化与校准**
+
+- 校准入口：`python/tools/run_calibration.py`。支持的方法：`mse`、`max`、`kl`、`percentile9999`、`aciq_laplace`、`aciq_gauss`；还有 `--search`（`search_threshold`/`search_qtable`/`fast_search`/`mix_search`）、`--mix_mode`（INT4/INT8/FP8 混合）、`--sq`（SmoothQuant）、`--we`（weight equalization）、`--bc`（bias correction）、`--smc`（softmax correction）。【源码】`run_calibration.py:32-87`、`python/calibration/utils.py:41`
+- 校准算法实现：`python/calibration/kld_calibrator.py`（`BaseKldCalibrator`、`ActivationCalibrator`）、`search_threshold.py`、`search_qtable.py`、`smoothquant.py`、`mix_precision.py`、`softmax_correction.py`。【源码】`python/calibration/` 目录
+- 校准结果是一张文本表：`name threshold min max`；`ImportCalibrationTable` pass 用正则解析后写成 `top` op 的 `threshold/min/max` 属性，并可标记 `input_asym/output_asym`。【源码】`ImportCalibration.cpp:20-23,46,107-113,177-184`
+- 量化发生在 `convert-top-to-tpu`：F32 op 可直接转 F32/F16/BF16；要转 INT8 时先把类型改成 calibrated type，再按芯片生成 multiplier/shift/round mode；INT8 op 只能转 INT8 op。混精度时自动插 `CastOp`。【文档】`08_lowering.rst:4-30`
+- QDQ / QAT：`--convert-qdq-to-calibrated-dialect` pass 处理 `QuantizeLinear`/`DequantizeLinear`（`Passes.td:79-83`、`QDQConvert.cpp:21-100`）；`python/tools/deploy_qat.py` 处理 ONNX 里的 FakeQuantize 节点，生成校准表/qtable。【源码】
+- 当前 master 的量化类型比论文多：`DqTypeAttr` 包含 `NONE/F16/BF16/INT8/INT4/F8E4M3/F4/MXF4/NVF4/...`（`TpuOps.td:105`）；芯片支持矩阵见 `regression/chip.py:24-40`；README 还提到 AWQ/GPTQ/AutoRound 预量化模型可直接透传（`README.md:39-42`）。【源码】【文档】
+
+**验证**
+
+TPU-MLIR 的验证是**分阶段**的，这一点对本项目最有参考价值：
+
+| 阶段 | 比较对象 | 入口 | 默认阈值 |
+|---|---|---|---|
+| 前端后 | 原始框架推理 vs `top.mlir` | `model_transform.py:103-167`（`model_validate`） | `--tolerance` 默认 `0.99,0.99`（`model_transform.py:459-460`） |
+| lowering 后 | `top.mlir`（F32 参考）vs `tpu.mlir` | `model_deploy.py:488-509`（`validate_tpu_mlir`） | `model_deploy.py:78-88`：F32 `0.99,0.99`；F16/BF16 `0.99,0.90`；INT8/weight-only `0.90,0.80`；FP8 `0.80,0.50` |
+| codegen 后 | `tpu.mlir` vs `bmodel`（量化时改为 `top.mlir` vs `bmodel`） | `model_deploy.py:592-607`（`validate_model`） | `--correctness` 默认 `0.99,0.90`，qtable 模式默认 `0.98,0.80`（`model_deploy.py:136-140`） |
+| 回归 | 模型级端到端 | `regression/run_model.py` | `run_model.py:110-120`：f32 `0.99,0.99`、f16 `0.95,0.85`、bf16 `0.95,0.80`、int8 `0.8,0.5`、f8e4m3 `0.8,0.5`、f8e5m2 `0.7,0.4` |
+
+> **论文与源码的阈值差异**：[Hu22] 声称 F32 要求完全相同，BF16/F16 用 cosine>0.95 / Euclidean>0.85，INT8 用 cosine>0.9 / Euclidean>0.5。当前源码的默认值是“cos,euclid”二元组，F16/BF16 在 deploy 阶段用 `0.99,0.90`、回归阶段用 `0.95,0.85`；INT8 已放宽到 `0.8,0.5`。这些是经验阈值，会随芯片/模型调整，**不能把论文数字当成固定契约**。【源码】
+
+**回归与调试工具**
+
+- `regression/run.sh` + `regression/main_entry.py`：按 `op`/`model`/`script` 三组跑；测试用例支持矩阵在 `regression/chip.py`；日志在 `regression/regression_out/`。【源码】`CLAUDE.md`、`regression/main_entry.py:1-50`
+- `python/test/test_onnx.py` 等单 op 测试：`test_onnx.py --case Conv2d --chip bm1684x`；测试内部也做多层对拍（ref vs tpu vs bmodel），阈值写死在用例里（如 `test_onnx.py:679-734`）。【源码】
+- `python/eval/model_inference.py`：统一加载 ONNX / MLIR / bmodel 做推理对比。【源码】`python/eval/model_inference.py:1-40`
+- `python/debugger/`：按芯片分 `target_1684x`、`target_1688`、`target_1690`、`target_cv18xx` 等目录，提供 `static_check.py`、`final_mlir.py`、`tdb_support.py`、`pmu_support.py` 等；支持逐层/逐指令的定位。【源码】`python/debugger/` 目录
+- `python/tools/model_runner.py`：`mlir_inference`（CPU/CUDA 两种实现）、`onnx_inference`、`bmodel_inference`，是各级验证的公共底座。【源码】`model_runner.py:460-575`
+
+#### 3.5.6 对 ONNX → Triton 的可借鉴点
+
+下表把 TPU-MLIR 的做法逐条映射到本项目。**“直接借鉴”指架构/流程可照搬；“需改造”指概念可用但要换实现。** 表中 TPU-MLIR 一侧的事实来自 §3.5.2–§3.5.5 的【源码】/【文档】；“对 ONNX → Triton 的落地方式”与判断属于本报告的【推断】。
+
+| # | 借鉴点 | TPU-MLIR 的具体做法 | 对 ONNX → Triton 的落地方式 | 判断 |
+|---|---|---|---|---|
+| 1 | **两层 IR：语义层 + 目标层** | `top`（框架无关）→ `tpu`（芯片相关） | `GraphIR`/`onnx` 语义层 → 一个“Triton target IR”层；本报告方案 B 里是 `KernelPlan` + TTIR | 直接借鉴 |
+| 2 | **用 op interface 做 pass 边界** | `ShapeInterface`/`InferenceInterface`/`GlobalGenInterface` 把“每个 op 要提供什么”声明化 | 为 `GraphIR` 的每个 op 定义 `verify/shape/infer/emit` 接口；lowering 注册表按 op 分发，而不是巨型 `if/elif` | 直接借鉴 |
+| 3 | **前端只建图，shape 交给独立 pass** | 前端发 `UnrankedTensorType`，`shape-infer` 统一补全 | B 方案里对应“importer 只建 SSA 图 + 独立 shape/type 分析”；不要在每个 emitter 里重复算 shape | 直接借鉴 |
+| 4 | **权重与 IR 分离** | `top.Weight` 只存名字，数据在 `.npz`；`WeightToNpz` 只导出被引用的 tensor | 对应本报告 §2.3 的“权重外置 blob + manifest”；TTIR 里不要塞 `arith.constant dense<...>` | 直接借鉴 |
+| 5 | **量化/校准是独立阶段** | 校准表 → `top` 属性 → lowering 时决定量化类型 | 若 v0 不做量化，至少把 `KernelPlan` 的 dtype 字段与“量化表”接口预留出来；不要让 emitter 假设只有 F32 | 需改造 |
+| 6 | **分阶段数值验证** | ONNX vs TOP、TOP vs TPU、TPU vs bmodel、bmodel vs 设备 | ONNX vs GraphIR、GraphIR vs TTIR、TTIR vs cubin、cubin vs ORT；每级设独立阈值 | 直接借鉴 |
+| 7 | **保留高层融合 op，让后端选择实现** | `top.Attention`/`top.FAttention`/`top.Mlp` 一直保留到 `tpu` 层 | GraphIR 里保留 `Attention`/`Gemm+Act` 等融合节点；`KernelPlan` 决定是展开成多个 TTIR kernel 还是一个融合 kernel | 直接借鉴 |
+| 8 | **按形状/阶段 specialization** | LLM 把一层拆成 prefill / prefill_kv / decode，decode 再按上下文长度生成多个 `block_cache_*` 变体 | 同一模型按 shape bucket 编译多份 `.ttir` + manifest 变体；动态 batch 用“静态 tile + mask”而不是一份万能 kernel | 需改造 |
+| 9 | **目标层承担内存/切片规划** | layer group + address assign 在 `tpu` 层，不在前端 | 对应“kernel 划分 + buffer liveness/复用”应放在 `KernelPlan` 之后的独立阶段，不要塞进 ONNX importer | 直接借鉴 |
+| 10 | **每芯片一个 lowering 目录** | `TopToTpu/{BM1684,BM1684X,CV18xx}` + codegen 方法名带芯片后缀 | 每目标后端（sm70/sm80/AMD）一个 `TtirBackend` 实现；公共 lowering 只依赖接口 | 直接借鉴 |
+| 11 | **可复现的产物清单** | `final.mlir`、`*_tpu.mlir`、`bmodel`、`*_weights.npz`、`layer_group_cache.json`、tensor location json | 本报告 §1.4 的 `manifest.json` 可再加 `final_ir`、`weights`、`layer_group`/`kernel_plan` 字段 | 直接借鉴 |
+| 12 | **调试器按层/按指令定位** | `python/debugger/` 的 `final_mlir`、`tdb`、`static_check` | 对应“TTIR golden + 每 kernel 的输入输出 dump”；先做文本级 diff，再做执行级对拍 | 需改造 |
+
+**最值得直接抄的三件事**
+
+1. **“两层 + 接口”的骨架**：`top`/`tpu` 的划分说明“图语义”和“目标实现”可以放在两个 dialect 里，用 interface 而不是继承来解耦。本项目的 `GraphIR` 与 TTIR 之间也应该有明确的 `KernelPlan` 契约（§1.4、§6.2）。
+2. **分阶段验证的工程纪律**：TPU-MLIR 每一级都有“参考实现 vs 编译产物”的对拍，并且阈值按 dtype 分档。本报告 §6.4 原来只写了最终对拍，§6.4.1 已按此补上中间层。
+3. **高层 op 的保留策略**：`top.Attention`/`top.Mlp` 没有在进入 `tpu` 前被拆碎，而是由后端决定用 `tpu.Attention` 还是 `tpu.FAttention`。这直接支持本报告“保留融合 op 供后端选择”的建议（§5.3）。
+
+**不能照抄的三件事**
+
+1. **layer group 的 N/H 切片**：它解决的是“LMEM 只有十几 MB、需要把连续 op 塞进片上”的问题；Triton 的对应问题是“block 形状必须是 2 的幂、单 block ≤ 1M 元素”，两者的切分约束不同（§1.3.3、§5.2）。
+2. **address assign 的物理地址分配**：bmodel 需要 DDR 物理地址；TTIR 只需要指针参数 + manifest，地址由 runtime 分配。
+3. **每芯片 codegen 方法名**：`codegen_global_bm1684x` 这类接口是 TPU 后端 ABI，不能映射到 TTIR。
+
+#### 3.5.7 不可复用的 TPU 专用部分与适用边界
+
+下表的“位置”是【源码】事实；“为什么不能复用”是【推断】。
+
+| 组件 | 位置 | 为什么不能复用 |
+|---|---|---|
+| `tpu` dialect | `include/tpu_mlir/Dialect/Tpu/IR/TpuOps.td` | 187 个 op 面向 TPU 引擎（TIU/GDMA/BDC 等），没有 `tt.load/store/dot` 的语义 |
+| 芯片 codegen 接口 | `Interfaces/GlobalGenInterface.td`、`LocalGenInterface.td` | 方法名与参数直接绑定 `bm1684/bm1684x/cv18xx`，实现依赖厂商库 |
+| 后端库 | `lib/Backend/BM168x`、`lib/Backend/CV18xx`、`lib/PplBackend` | 调用 SOPHGO 的 kernel API / 固件，不是 LLVM/Triton 后端 |
+| layer group | `lib/Dialect/Tpu/Transforms/LayerGroup/` | 依赖 LMEM 大小、bank、`BackwardH` 等 TPU 存储模型 |
+| memory assign | `AddressAssign/BMAddressAssign.cpp` | 分配的是 bmodel 的物理地址，不是 host/device 指针 |
+| bmodel | `lib/Builder/bmodel.cpp` + `bindings/pyruntime/` | flatbuffers schema 与 `bmruntime` 运行时是 SOPHGO 私有格式 |
+| 校准/量化实现 | `python/calibration/`、`TopToTpu` 的量化代码 | 阈值算法可参考，但 symmetric per-channel/per-group 的量化参数与 TPU 指令编码强绑定 |
+| SOPHGO 配置 | `regression/chip.py`、`lib/Backend/BM168x/*.cpp` | 芯片枚举、支持矩阵、指令编码都是厂商特定 |
+
+**适用边界**
+
+- 可以借鉴的是**编译器的组织方式**：分层、接口、pass 顺序、验证纪律、权重外置、高层 op 保留。
+- 不能借鉴的是**目标相关实现**：`tpu` op、芯片 codegen、layer group、物理内存分配、bmodel/PyRuntime。
+- 对本项目而言，TPU-MLIR 相当于“方案 A 的工业存在性证明”：它说明 MLIR 分层路线可以做到产品级；但方案 A 要落地到 Triton，仍必须自己完成 `onnx/top` 语义 → `tt` tile 原语的 lowering，并且对齐 Triton 固定的 LLVM 版本（§4.1 缺点）。
+
+#### 3.5.8 Hu26b 的 LLM 扩展：prefill / prefill_kv / decode
+
+[Hu26b]（arXiv:2607.15865，2026-07-17）以 TPU-MLIR 为实现载体，讨论 LLM 的 MLIR 编译方法。它的关键点不是“又支持了一个模型”，而是**按执行阶段做静态特化**。
+
+**论文声称**
+
+- 把 Transformer layer 拆成三个阶段静态编译：**prefill**（prompt 并行）、**prefill_kv**（拼接历史 KV）、**decode**（逐 token）。
+- decode 按上下文长度编译多个 `block_cache_*` 变体。
+- KV cache 用地址复用/原地更新，避免拷贝。
+- 量化支持 F32/BF16/F16/INT8，以及 AWQ/GPTQ/AutoRound；实验用 W4BF16。
+- 实验：单张 Sophgo BM1684X，Qwen3.5-2B/4B/9B，decode TPS 30.00/16.77/9.84，带宽利用率 78.0%/78.6%/83.0%。
+
+**当前 master 源码确认**
+
+- 阶段函数：`compile_block`（prefill）、`compile_block_kv`（history KV）、`compile_block_cache`（decode）；注释直接写“prompt phase”“kv phase”“decode phase”。【源码】`python/llm/LlmConverter.py:2505-2527`
+- decode 变体：`gen_block_cache_by_length(kv_length, stage_idx)` 生成 `block_cache_{idx}`；当 `decode_chunk_list` 非空时，再按 `stage_idx+1` 生成 `block_cache_{idx}_{stage}`。【源码】`LlmConverter.py:2272-2286,2407-2415`
+- 历史 KV 开关：`--use_history_kv` / `--use_block_with_kv`。【源码】`python/tools/llm_convert.py:159-160`
+- 量化：`llm_convert.py` 的 `--quantize`、`--q_group_size`、`--symmetric`、`--vit_quantize`；模型家族覆盖 Qwen2/2.5/3/3.5、Llama3.2-V、Gemma3/4、MiniCPM-V、InternVL3、Phi3、Falcon、ChatGLM、Step3-VL 等（`python/llm/` 下 35 个 Python 文件、多个 `*Converter.py`）。【源码】
+- 论文说的 `top.MLP`/`top.FAttention` 在源码里对应 `Top_MlpOp`（`TopOps.td:4313`）与 `Top_FAttentionOp`（`TopOps.td:2359`），以及 `Tpu_MlpOp`（`TpuOps.td:5248`）/`Tpu_FAttentionOp`（`TpuOps.td:2864`）。也就是说，**融合高层 op 确实一直保留到目标层**。【源码】
+
+**它与通用 ONNX → Triton 的关系**
+
+- **相同点**：都面对“同一张图在不同 shape 下需要不同 kernel”的问题。TPU-MLIR 的答案是“编译多个阶段/长度变体，运行时按阶段选择”；这与本报告 §1.4、§5.4 建议的“每个 kernel 一个 `.ttir` + manifest 变体”是同一思路。
+- **不同点**：TPU-MLIR 的阶段切分发生在 **LLM 前端**（`LlmConverter` 按 Transformer 结构生成多个 block 的 MLIR），不是通用的 ONNX 图变换；它依赖对模型结构的先验知识（层数、KV head、hidden size、decode chunk），不能从任意 ONNX 图自动推导。
+- **对 Triton 的启示**：可以借鉴“按阶段/形状编译多份产物”的工程模式，但不要指望它提供 ONNX → TTIR 的 lowering；它连 `tt` dialect 都不涉及。
+- **报告结论是否改变**：不改变。[Hu26b] 的目标是 TPU，不讨论 Triton IR，也没有 ONNX → Triton 实验；它只进一步说明“MLIR + 多层方言 + 静态特化”在大模型场景也可行。【推断】
+
 ---
 
 ## 4. 可行架构方案对比
@@ -646,6 +1061,17 @@ flowchart LR
 
 - **A1：ONNX dialect → `tt` dialect 直接转换**。用 `ConversionTarget` 把 `tt` 标为 legal、`onnx` 标为 illegal，用 `OpConversionPattern` 逐算子构造 `tt.load/store/dot/reduce`。
 - **A2：ONNX → linalg → `tt`**。先补 onnx-mlir 的 ONNXToLinalg（目前只有 2 个 op），再写 linalg→tt 的通用 pass；这条路线需要同时维护 ONNX→linalg 与 linalg→tt 两套 lowering，前期成本较高。【推断】
+
+#### 工业先例：TPU-MLIR（2026-11-13 增补）
+
+TPU-MLIR 是“方案 A 的工业存在性证明”，但它证明的范围需要精确界定：
+
+- **它验证了什么**：ONNX → MLIR 语义层（`top`）→ 目标层（`tpu`）→ 目标二进制（`bmodel`）这条链路，在 1000+ stars 的开源产品中持续维护了四年，前端、lowering、layer group、内存分配、codegen 各阶段都有明确的 pass 边界和 op interface（§3.5.2、§3.5.4）。这说明“用 MLIR 分层做端到端部署”不是论文里的玩具，而是可维护的工程架构。
+- **它没有验证什么**：它的 target dialect 是 `tpu`，不是 `tt`；它的后端是 SOPHGO 的 kernel API，不是 Triton/LLVM；它没有 `tt.load/store/dot` 的 lowering，也没有处理 Triton 的“block 每维 2 的幂”“单 block ≤ 1M 元素”“`tt.dot` 只接受 2D/3D”等硬约束（§1.3.3）。因此它**不能**降低方案 A 在 `tpu → tt` 这一段的工作量。
+- **对方案 A 的直接启示**：如果把方案 A 定义成“`onnx` 语义层 → 自有目标层 → `tt`”，那么 TPU-MLIR 的 `top`/`tpu` 划分可以直接借用：语义层保留 `Conv/MatMul/Attention` 等高层 op，目标层再决定展开成 `tt.dot` + mask 还是其他组合；两层之间的 `ConvertTopToTpu` 对应本项目的“GraphIR → KernelPlan”pass。
+- **仍需自己解决的部分**：`tt` dialect 的构造（`tt.load/store/dot/reduce` + mask + 地址算术）、与 Triton 固定 LLVM 版本的对齐、TTIR verifier、以及 §4.1“缺点”里列的 MLIR 版本地狱。TPU-MLIR 的 codegen 接口不能替代这些工作。
+
+结论：TPU-MLIR **强化了方案 A 的可行性论证**，但没有改变方案 A 的成本结构；它更适合作为“两层 IR 怎么切、pass 怎么排、验证怎么做”的参考实现，而不是可复用的 lowering 库。【源码】【检索】【推断】
 
 #### 需要的组件
 
@@ -1184,6 +1610,27 @@ def extract_ttir(source_path: str, signature: dict, constexprs: dict,
 - IR 级：对每个生成的 `.ttir` 做 parse + verify；对关键 op 做 FileCheck golden。
 - 执行级：用 Triton 的 launcher 或 cuda-python driver API 启动；本机无 torch，可直接用 cuda-python 的 driver API 管理 primary context 并 launch。【推断】
 
+#### 6.4.1 分阶段数值验证（2026-11-13 增补，借鉴 TPU-MLIR）
+
+本报告原来的验证方案主要对“最终产物”和 onnxruntime 对拍；TPU-MLIR 的实践说明，**中间层对拍**能在早期定位问题，避免所有错误都堆到 cubin 执行阶段（§3.5.5）。
+
+建议在本项目的 harness 中加入四级验证：
+
+| 级别 | 参考对象 | 被测对象 | 测什么 | 阈值建议 |
+|---|---|---|---|---|
+| L1 | onnxruntime（同输入） | GraphIR 的解释执行（可选） | 前端解析、常量折叠、opset 语义 | 与 ORT 完全相同（F32 bit-exact 不现实时用 `rtol=1e-6`） |
+| L2 | GraphIR 的参考实现 | `KernelPlan` 的逐 kernel 输出 | 融合边界、tile 切分、mask 正确性 | `max_abs_err` / `cos`，按 dtype 分档 |
+| L3 | `.ttir` 的参考执行（可用 Triton interpreter 或 CPU kernel） | `triton.compile` 后的 cubin 执行结果 | Triton 前端/后端是否改变了语义 | 仅允许浮点重排误差 |
+| L4 | ORT / 原始模型 | 最终 cubin 端到端 | 全链路 | F32 `1e-5`、F16/BF16 `1e-2`、INT8 另定 |
+
+**阈值必须按 Triton 重定，不能照抄 TPU-MLIR**：
+
+- TPU-MLIR 用的是 `cos,euclid` 二元组（如 F16 `0.95,0.85`、INT8 `0.8,0.5`），面向的是 TPU 量化后的近似；Triton 路径在 v0 不做量化时，F32 应该用 `rtol/atol`（如 `1e-5`），而不是 cosine。
+- F32 matmul 必须显式 `input_precision="ieee"`，否则 tf32 会造成 1e-3 量级差异（§1.3.3、§5.11）；这一条不能靠“放宽阈值”掩盖。
+- 如果未来引入 F16/BF16/INT8，再按 dtype 增加 `cos,euclid` 档位，并记录“参考实现是 ORT 还是 Triton interpreter”。
+
+**落地方式**：在 `manifest.json` 里为每个 kernel 记录 `verification` 字段（参考输出、阈值、seed、dtype），CLI 增加 `ox2tt verify --stage graph|plan|ttir|cubin`。这样任何一级失败都能直接定位到“前端 / 划分 / 生成 / 编译”中的一段，而不是只看到最终数值不对。【推断】
+
 ### 6.5 里程碑
 
 | 里程碑 | 目标 | 验收标准 |
@@ -1219,6 +1666,8 @@ def extract_ttir(source_path: str, signature: dict, constexprs: dict,
 4. **不要一开始绑定 onnx-mlir**：ONNX 解析/形状推断用 `onnx` Python 包即可；onnx-mlir 作为参考实现和未来的 A 前端候选，而不是 v0 的硬依赖。
 5. **固定 Triton 3.8.0**（本机已安装），不要混用 `/root/triton` 的 3.6.0 源码；如果要从源码构建，先统一版本再谈。
 6. **暂不引入 NineToothed/InfiniOps**：v0 直接生成 Triton Python；把 `KernelPlan → 源码` 抽象成可替换的 `KernelEmitter`，未来若需要多硬件或更高层抽象，再增加 B′（NineToothed）实现。InfiniOps 只在产品目标扩展为“多硬件执行 ONNX 图”时评估，不作为 v0 依赖（见 §3.4、§4.2.1）。
+7. **在 GraphIR 与 TTIR 之间显式保留“语义层 / 目标层”的边界**（2026-11-13 增补，借鉴 TPU-MLIR 的 `top`/`tpu` 划分）：v0 的 GraphIR 是语义层，`KernelPlan` 是目标层；不要把 ONNX 的 op 语义直接泄进 emitter。具体做法是把 `KernelPlan` 定义成稳定契约（tile shape、grid、dtype、输入输出、融合组），emitter 只消费它。这样未来接方案 A 时，只需替换 `KernelPlan → TTIR` 这一段（§3.5.6、§4.1）。
+8. **把分阶段数值验证纳入 MVP，而不是“以后再说”**（2026-11-13 增补）：至少做 L2（GraphIR vs KernelPlan）和 L4（cubin vs ORT）两级；如果时间允许，再加 L3（TTIR 参考执行 vs cubin）。阈值按 §6.4.1 重定，不要照抄 TPU-MLIR 的 `cos,euclid`。这是 TPU-MLIR 最可直接复制的工程纪律。
 
 ### 7.2 为什么推荐 B
 
@@ -1251,7 +1700,10 @@ def extract_ttir(source_path: str, signature: dict, constexprs: dict,
 | 两级 codegen 调试成本（若选 B′） | 中 | 中 | 保留直接生成 Triton 的 B 路径；对 B′ 产物做源码 diff + TTIR golden |
 | InfiniOps 构建矩阵与 InfiniRT 依赖（若接 fallback） | 高 | 中 | 仅在明确多硬件目标时引入；用独立进程/动态库隔离；不进入 v0 |
 | InfiniOps/C++ ABI 与 Tensor 约定不匹配 | 中 | 中 | 通过 host 侧 adapter 转换；不试图在 TTIR 内调用外部算子 |
-| 把“相邻工作”误当成 ONNX 前端（认知风险） | 中 | 中 | 明确分层：NineToothed=kernel 生成，InfiniOps=算子执行，ONNX 前端仍要自研 |
+| 把“相邻工作”误当成 ONNX 前端（认知风险） | 中 | 中 | 明确分层：NineToothed=kernel 生成，InfiniOps=算子执行，TPU-MLIR=ONNX→MLIR→TPU，ONNX→Triton 前端仍要自研 |
+| 两层 IR 设计过度，v0 就引入完整 MLIR 目标层（2026-11-13 增补） | 中 | 中 | v0 只保留“GraphIR + KernelPlan”两个 Python 数据结构，不引入 MLIR 依赖；把 `KernelPlan → TTIR` 做成可替换接口，等方案 A 真启动时再上 MLIR |
+| 照抄 TPU-MLIR 的验证阈值/验证层级（2026-11-13 增补） | 中 | 中 | TPU-MLIR 阈值面向量化 TPU；Triton 路径按 dtype 重定（§6.4.1），F32 用 rtol/atol 且强制 `input_precision="ieee"` |
+| 误以为 TPU-MLIR 可复用 lowering（2026-11-13 增补） | 中 | 高 | 明确它的 `tpu` dialect / codegen / layer group / bmodel 全部不可复用；只用它的分层、接口、pass 顺序与验证纪律（§3.5.7） |
 
 ### 7.5 需要用户决策的点
 
@@ -1267,6 +1719,9 @@ def extract_ttir(source_path: str, signature: dict, constexprs: dict,
 10. **是否需要多硬件后端**：如果未来要覆盖 Ascend/寒武纪等，是否考虑 NineToothed 的 AscendC/BangC 后端（目前是 scalar baseline，性能不足）或 InfiniOps 的原生算子？这决定 B′ 是否值得做。
 11. **是否接受 NineToothed 作为编译期依赖**：它的 PyPI 版本落后 HEAD 36 个提交，必须固定 git commit；团队是否接受这种 0.x 依赖策略？
 12. **fallback 的层级**：如果某些算子 Triton 难以表达，fallback 放在 host 运行时（InfiniOps/PaddleTritonOps）还是直接标记“不支持”？前者会把项目从“IR 转换器”推向“多后端执行框架”。
+13. **是否引入“语义层 + 目标层”两层 IR（2026-11-13 增补）**：TPU-MLIR 的 `top`/`tpu` 划分证明两层可维护，但也带来“同一 op 定义两遍、两次 shape/类型转换”的成本。v0 是否只做“GraphIR（语义）+ KernelPlan（目标）”两个轻量结构，等需要 MLIR 时再升级为两个 dialect？这是一个架构决策，建议明确写进设计文档。
+14. **是否把量化/校准纳入范围（2026-11-13 增补）**：TPU-MLIR 的量化链路（校准表 → `top` 属性 → lowering 量化）很完整，但它是 INT8/INT4 TPU 量化的形状。本项目的 v0 是否只做 F32/F16/BF16，把量化留到有明确需求时？如果要做，是复用 ONNX QDQ 还是自建校准表？这会影响 `KernelPlan` 的 dtype 字段和验证阈值（§6.4.1）。
+15. **是否采用分阶段验证（2026-11-13 增补）**：TPU-MLIR 每级都对拍，代价是每个测试要跑多套参考实现。本项目是否接受“M0 就加 L2/L4 两级验证”的工程成本？建议接受，因为 Triton 的 mask/tf32/融合边界问题在最终数值上很难定位。
 
 ---
 
@@ -1355,6 +1810,55 @@ InfiniOps（本地 `/root/InfiniOps`）：
 - `/root/InfiniOps/docs/operator-api-alignment.md:3-4,31-32`（ONNX 语义对齐）
 - `/root/InfiniOps/LICENSES/`、`/root/InfiniOps/THIRD_PARTY.txt`（第三方许可证）
 
+TPU-MLIR（本地 `/root/tpu-mlir-master`，2026-11-03 master 快照）：
+
+- `/root/tpu-mlir-master/README.md:29-46`（定位、多前端、LLM、量化、工具链）
+- `/root/tpu-mlir-master/README_cn.md:30-41`（中文定位与量化工具链）
+- `/root/tpu-mlir-master/LICENSE:1-5`（2-Clause BSD）
+- `/root/tpu-mlir-master/CLAUDE.md`（架构、pass、测试命令、chip 列表）
+- `/root/tpu-mlir-master/include/tpu_mlir/Dialect/Top/IR/TopOps.td:35-42`（`top` dialect）、`:195-206`（`top.Weight`）、`:260-272`（`top.Input` + `shape_tensor`）、`:296-301`（`Top_Op` 接口）、`:1507`（`SupportFuseRelu` 的 Conv）、`:2359`（`top.FAttention`）、`:4313`（`top.Mlp`）
+- `/root/tpu-mlir-master/include/tpu_mlir/Dialect/Tpu/IR/TpuOps.td:43-47`（`tpu` dialect）、`:105`（`DqTypeAttr`）、`:107-134`（`Tpu_LayerGroupAttr`）、`:423-429`（`Tpu_Op` 接口）、`:846`（`tpu.Attention`）、`:2864`（`tpu.FAttention`）、`:5248`（`tpu.Mlp`）
+- `/root/tpu-mlir-master/include/tpu_mlir/Interfaces/GlobalGenInterface.td:15-56`（`codegen_global_bm1684/bm1684x/cv18xx`）
+- `/root/tpu-mlir-master/include/tpu_mlir/Interfaces/LocalGenInterface.td:15-395`（`codegen_local_*`、`BackwardH/N/D/W/C`、`assign_sec_info`）
+- `/root/tpu-mlir-master/include/tpu_mlir/Interfaces/InferenceInterface.td:15-53`（`inference`/`init`/`deinit`）
+- `/root/tpu-mlir-master/include/tpu_mlir/Dialect/Top/Transforms/Passes.td:67-95`（`import-calibration-table`、`convert-qdq-to-calibrated-dialect`、`shape-infer`）
+- `/root/tpu-mlir-master/include/tpu_mlir/Dialect/Tpu/Transforms/Passes.td:52-76`（`layer-group` 选项）、`:95-117`（`address-assign`）、`:139-157`（`codegen`）
+- `/root/tpu-mlir-master/include/tpu_mlir/Conversion/Passes.td:19-22`（`convert-top-to-tpu`）
+- `/root/tpu-mlir-master/python/transform/OnnxConverter.py:107-140`（`OnnxConverter` 初始化、`unranked_type`）、`:176-450`（129 个 op 的映射表）、`:452-470`（`model_simplify`/`onnxsim`）、`:499-561`（`load_onnx_model`）、`:727-796`（`generate_mlir`、unsupported 检查）、`:3528-3575`（`If`/`Loop` 子图）
+- `/root/tpu-mlir-master/python/transform/BaseConverter.py:78-133`（`isWeight`/`getWeightOp`/`WeightToNpz`）
+- `/root/tpu-mlir-master/python/transform/MLIRImporter.py:167-173`（`UnrankedTensorType`）、`:218-246`（`create_input_op`）、`:247-268`（`create_weight_op`）、`:270-273`（`create_return_op`）
+- `/root/tpu-mlir-master/python/transform/OnnxOpt.py:354-367`（`onnx.shape_inference.infer_shapes`）
+- `/root/tpu-mlir-master/python/utils/mlir_shell.py:508-517`（`top_opt_options`）、`:518-540`（`mlir_opt_for_top`）、`:543-590`（`lowering_options`）、`:592-642`（`mlir_lowering`）、`:667-760`（`tpu_ada_options`）、`:898-908`（`codegen_options`）、`:960-1090`（`mlir_to_model`）
+- `/root/tpu-mlir-master/python/tools/model_transform.py:58-103`（`model_mlir`/`model_transform`）、`:103-167`（`model_validate`）
+- `/root/tpu-mlir-master/python/tools/model_deploy.py:70-95`（量化/容差默认值）、`:256-295`（`lowering`）、`:488-509`（`validate_tpu_mlir`）、`:511-580`（`build_model`）、`:592-607`（`validate_model`）
+- `/root/tpu-mlir-master/python/tools/run_calibration.py:32-87`（校准方法/搜索/混精选项）
+- `/root/tpu-mlir-master/python/calibration/utils.py:41`（`calibration_methods`）
+- `/root/tpu-mlir-master/python/tools/llm_convert.py:129-207`（LLM 转换参数）
+- `/root/tpu-mlir-master/python/tools/deploy_qat.py:11-40`（FakeQuantize 节点处理）
+- `/root/tpu-mlir-master/python/llm/LlmConverter.py:2272-2286,2407-2415`（`block_cache_*` 变体）、`:2505-2527`（prefill/prefill_kv/decode 三阶段）
+- `/root/tpu-mlir-master/lib/Dialect/Top/Canonicalize/BatchNorm.cpp:14-70`（BN→Scale）
+- `/root/tpu-mlir-master/lib/Dialect/Top/Transforms/ShapeInfer.cpp:207-238`（`ShapeInterface`/`InferenceInterface` 驱动 shape infer）
+- `/root/tpu-mlir-master/lib/Dialect/Top/Transforms/ImportCalibration.cpp:20-23,107-113`（校准表字段）
+- `/root/tpu-mlir-master/lib/Dialect/Top/Transforms/ExtraOptimize.cpp:38-66`（`FuseSameOp`/`InputReshape`/FLOPs/weight fold）
+- `/root/tpu-mlir-master/lib/Conversion/TopToTpu/TopToTpuPass.cpp:1558`（`runOnOperation`）、`:1966`（`calibration_process`）、`:2110-2122`（`relu_process`）、`:2514-2525`（`qmode`/`init_qtable`）
+- `/root/tpu-mlir-master/lib/Dialect/Tpu/Transforms/LayerGroup.cpp:67-70`（`LayerGroupPass`）、`lib/Dialect/Tpu/Transforms/LayerGroup/LmemAllocator.cpp:239-306`（LMEM 分配/复用）
+- `/root/tpu-mlir-master/lib/Dialect/Tpu/Transforms/AddressAssign/BMAddressAssign.cpp:500-511`（L2 SRAM 分配）、`:1022-1025`（`GmemAllocator::assignGaddr`）
+- `/root/tpu-mlir-master/lib/Dialect/Tpu/Transforms/Codegen.cpp:18-66`（`CodegenPass`）、`Codegen/BM168xCodegen.cpp:102-137,139-333`（`BMCodegen::init/run`）
+- `/root/tpu-mlir-master/lib/Builder/bmodel.cpp:28-31`（`BMODEL_VERSION 2.2`、magic）
+- `/root/tpu-mlir-master/bindings/pyruntime/pyruntime_bm.cpp:14-30`（PyRuntime 绑定）
+- `/root/tpu-mlir-master/python/tools/model_runner.py:460-575`（`mlir_inference`/`onnx_inference`/`bmodel_inference`）
+- `/root/tpu-mlir-master/python/eval/model_inference.py:1-40`（ONNX/MLIR/bmodel 统一推理）
+- `/root/tpu-mlir-master/python/debugger/`（按芯片分 target 目录的调试器）
+- `/root/tpu-mlir-master/regression/chip.py:24-49`（芯片/量化支持矩阵）
+- `/root/tpu-mlir-master/regression/run_model.py:110-120`（回归容差）
+- `/root/tpu-mlir-master/python/test/test_onnx.py:679-734`（单 op 多层对拍阈值）
+- `/root/tpu-mlir-master/docs/developer_manual/source_en/04_over_design.rst:5-60`（Top/Tpu 分层与 pass 列表）
+- `/root/tpu-mlir-master/docs/developer_manual/source_en/08_lowering.rst:4-30`（F32/F16/BF16/INT8 lowering 与混精 Cast）
+- `/root/tpu-mlir-master/docs/developer_manual/source_en/10_layergroup.rst:5-40`（N/H 切片、`BackwardH`）
+- `/root/tpu-mlir-master/docs/developer_manual/source_en/11_memassign.rst:4-30`（GMEM 生命周期复用）
+- `/root/tpu-mlir-master/docs/developer_manual/source_en/12_codegen.rst:8-40`（指令生成/存储/取回）
+- `/root/tpu-mlir-master/docs/developer_manual/source_en/05_frontend.rst:5-45`（前端转换流程）
+
 ### 8.2 官方文档与规范
 
 - ONNX IR 规范：https://onnx.ai/onnx/repo-docs/IR.html
@@ -1371,6 +1875,10 @@ InfiniOps（本地 `/root/InfiniOps`）：
 - MLIR Dialect Conversion：https://mlir.llvm.org/docs/DialectConversion/
 - MLIR Defining Dialects：https://mlir.llvm.org/docs/DefiningDialects/
 - MLIR Rewrite Patterns：https://mlir.llvm.org/docs/RewritePattern/
+- TPU-MLIR 开发者手册（整体设计）：https://tpumlir.org/developer_manual_en/04_over_design.html
+- TPU-MLIR 开发者手册（layer group）：https://tpumlir.org/developer_manual_en/10_layergroup.html
+- TPU-MLIR 开发者手册（memory assign）：https://tpumlir.org/developer_manual_en/11_memassign.html
+- TPU-MLIR 开发者手册（codegen）：https://tpumlir.org/developer_manual_en/12_codegen.html
 
 ### 8.3 社区项目与相关工作
 
@@ -1392,6 +1900,11 @@ InfiniOps（本地 `/root/InfiniOps`）：
 - InfiniTensor/ntops（NineToothed 算子库）：https://github.com/InfiniTensor/ntops
 - InfiniTensor/InfiniOps：https://github.com/InfiniTensor/InfiniOps
 - InfiniTensor/InfiniRT：https://github.com/InfiniTensor/InfiniRT
+- [Hu22] TPU-MLIR: A Compiler For TPU Using MLIR：https://arxiv.org/abs/2210.15016
+- [Hu26b] An MLIR-Based Compilation Method for Large Language Models：https://arxiv.org/abs/2607.15865
+- sophgo/tpu-mlir：https://github.com/sophgo/tpu-mlir
+- TPU-MLIR 官方文档：https://tpumlir.org/（英文开发者手册 https://tpumlir.org/developer_manual_en/index.html；快速上手 https://tpumlir.org/quick_start_en/index.html）
+- TPU-MLIR PyPI：https://pypi.org/project/tpu_mlir/
 
 ---
 
@@ -1490,3 +2003,17 @@ cubin bytes: 4968
 | InfiniRT | InfiniTensor 的跨平台运行时库，提供 device/stream/memory 抽象；InfiniOps 的硬依赖 |
 | operator library / 算子库 | 按算子逐个提供实现与调度，不含图级编译/融合；InfiniOps 属于此类 |
 | AOT | Ahead-of-Time，提前编译；NineToothed 可把 kernel 编译为 `.so` 并导出 C++ 源码/头文件 |
+| TOP dialect（`top`） | TPU-MLIR 的**语义层**方言：与框架/芯片无关，保留 Conv、MatMul、Attention、Mlp 等高层 op，负责 shape 推断、图优化与校准信息；对应本报告的 GraphIR |
+| TPU dialect（`tpu`） | TPU-MLIR 的**目标层**方言：与 SOPHGO 芯片相关，携带量化类型、layer group 切片、内存地址与指令生成接口；对应本报告的 KernelPlan/TTIR 位置 |
+| bmodel | TPU-MLIR 编译出的最终可部署二进制（flatbuffers 格式），由 PyRuntime/`bmruntime` 加载执行 |
+| calibration（校准） | 用少量真实样本统计每个张量的取值分布，算出一个 `threshold`（截断阈值），供 INT8/INT4 量化使用；结果通常存成 `name threshold min max` 的文本表 |
+| layer group | 把相邻的多个 op 按 N/H 维切片，使它们的数据尽量留在片上 LMEM（局部内存）里连续计算，减少与 DDR 的来回拷贝 |
+| memory assign（地址分配） | 给需要放在全局内存（GMEM）的张量分配地址，并按张量的生命周期复用已释放的空间；TPU-MLIR 的 `address-assign` pass 负责此事 |
+| PyRuntime | TPU-MLIR 的 Python 运行时绑定（`bindings/pyruntime/`），负责加载 `bmodel`、绑定输入输出、调用 `bmruntime` 执行推理 |
+| QDQ | QuantizeLinear + DequantizeLinear 的合称；ONNX 用这对 op 显式表达“量化到 int8 再反量化”，QAT 模型和量化 ONNX 常见 |
+| QAT | Quantization-Aware Training，训练时插入 FakeQuantize 节点，让模型适应量化误差；与 PTQ（训练后校准量化）相对 |
+| per-tensor / per-channel / per-group 量化 | 一组量化参数（scale/zero-point）作用的范围：整个张量 / 每个通道 / 每 G 个元素一组；粒度越细通常精度越好、开销越大 |
+| symmetric / asymmetric 量化 | 量化区间是否关于 0 对称。对称量化 zero-point 固定为 0，实现简单；非对称量化能更好利用区间，但需要 zero-point |
+| W4A16 / W8A16 | 权重 4-bit/8-bit、激活 16-bit 的混合精度方案；常见于 LLM 的 weight-only 量化，TPU-MLIR 的 `tpu.A16MatMul` 就是这类 op |
+| prefill / decode | LLM 推理的两个阶段：prefill 一次处理整段 prompt（并行），decode 每次只生成一个 token（串行）；两者的 shape 与性能特征不同，常分别编译 |
+| KV cache | LLM 自回归生成时缓存的历史 Key/Value 张量，避免每步重算；TPU-MLIR 用地址复用/原地更新来避免拷贝 |
